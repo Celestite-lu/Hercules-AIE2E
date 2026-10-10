@@ -15,8 +15,16 @@ dev_docs/
   evaluation/      评测框架与 UI 变异实验
   attributor/      失败归因器
   cli/             子进程编排 CLI
-  reports/         跨模块汇报（合并后分析、阶段总结）
+  benchmark/       MiniWoB++ 基准（plan/spec/review/test-report、round1-4 报告、失败分析、安全审查×8、baselines、agent-e-anatomy）
+  reports/         跨模块汇报（合并后分析、阶段总结、终审）
+  interview/       面试材料（简历/弹药库/讲述稿/红队报告/视频报告/演示视频资产）
+  dossier/         项目全档案（2026-10-10）：按知识域汇总全部决策与踩坑的 7 份档案 + 00 索引；面试追问的底层证据库，见 dossier/00-README.md
 ```
+
+## dossier 全档案的维护规则
+
+- dossier 是**汇总层**：一手事实永远以各模块四件套与实验报告为准；三处数字不一致时先改一手报告，再同步 dossier 与 interview/ 材料。
+- 新实验/新决策落地后，同步更新对应 dossier 档案与 00-README 的映射表。
 
 ## 每个模块的文档生命周期（强制，缺任何一份视为未完成）
 
