@@ -1,310 +1,213 @@
-# 全档案 01：录制器（recorder）+ 蒸馏器（distiller）
+# 01 — 录制器与蒸馏器（面试复习版）
 
-> 覆盖范围：`record2gherkin/recorder/`（注入式 JS 事件录制器 + bookmarklet 打包）、`record2gherkin/distiller/`（事件流 → Gherkin 确定性三层蒸馏），以及两者之间的契约（PLAN.md §3.1 事件 Schema v1）与合并后修复（P0-1 / P0-2 / 快照归因 / P1-4）。
-> 材料来源：dev_docs/recorder/{plan,spec,review,test-report}.md、dev_docs/distiller/{plan,spec,review,test-report}.md、dev_docs/reports/phase1-merge-analysis.md、PLAN.md §0–§3.2、record2gherkin 源码、tests/record2gherkin/{recorder,distiller}/、git 历史（4283ebe / 9664cd3 / 0ad2075 / fe11083 / 7ce6c95）。
-> 铁律声明：本文所有数字逐字来自源文档；源文档之间存在矛盾的，两说并注出处；无法核实的标注"未核实"。
+> 覆盖范围：`record2gherkin/recorder/`（注入式 JS 事件录制器 + bookmarklet 打包）、`record2gherkin/distiller/`（事件流 → Gherkin 的确定性三层蒸馏），两者之间的 Schema v1 契约，以及合并后修复（P0-1 / P0-2 / 快照归因 / P1-4）。
+> 要查原始细节：dev_docs/recorder/ 与 dev_docs/distiller/ 各自的 plan / spec / review / test-report、dev_docs/reports/phase1-merge-analysis.md、PLAN.md、record2gherkin 源码、tests/record2gherkin/。本页只保留面试要说的部分，全部数字逐字来自源文档。
 
-## 1. 这一页讲什么（3 句）
+## 1. 这一页讲什么（3 句）+ 复习法
 
-录制器是一个注入普通同源页面的单文件 JS（`window.R2GRecorder`，bookmarklet / DevTools Snippet 分发），把"人工点一遍页面"忠实捕获为 Schema v1 的 JSON 事件流（navigate/click/input/select/submit 五类），带 target 语义（name 五级优先级 + ordinal 消歧）、密码掩码、去噪与 300ms 延迟快照差集 `assert_texts`（Then 断言的 grounding 素材）。蒸馏器把事件流确定性蒸馏为恒合法的 Gherkin（1 Feature 1 Scenario）：规则模板层零模型依赖出骨架，可选 LLM 润色层做纯加法，事实回查层做硬闸——每个引号字面值必须 ⊆ 录制事实集，任一道闸不过就**整体**回退骨架；骨架自检失败则抛 `DistillError`（唯一主动抛错路径，视作程序 bug 不兜底）。两模块各自 20 条 spec 用例 / 35 条 spec 用例起家，经合并后分析（phase1-merge-analysis）修复 P0-1（click+submit 双事件去重）、P0-2（占位符注入落 CLI）、快照归因缺陷（Then 早于状态变化的假失败）、P1-4（标题文件名清洗）后，定格为 recorder 21 例 + distiller 68 例全绿（全局 492 passed 中的两个组成部分）。
+1. 录制器是一个注入普通同源页面的单文件 JS（挂在 `window.R2GRecorder` 上，用 bookmarklet——一条 `javascript:` 开头的收藏夹书签——或 DevTools Snippet 分发，零安装），把"人工点一遍页面"忠实捕获成 Schema v1 的 JSON 事件流：navigate/click/input/select/submit 五类事件，每条带 target 语义（name 五级优先级 + ordinal 同名消歧）、密码掩码、去噪，以及 300ms 延迟快照差集算出的 `assert_texts`——那是 Then 断言的 grounding 素材（即"每条断言都有录制时的页面原文做出处"）。
+2. 蒸馏器把事件流确定性蒸馏（翻译）成恒合法的 Gherkin，恒为 1 Feature 1 Scenario：规则模板层零模型依赖出骨架，可选 LLM 润色层做纯加法，事实回查层做硬闸——产物里每个引号字面值必须 ⊆ 录制事实集，四道闸任一道不过就整体回退骨架；骨架自检失败则抛 `DistillError`，这是全链路唯一主动抛错路径、视作程序 bug 不兜底。
+3. 两个模块各自从 20 条 / 35 条 spec 用例起家，经合并后分析修掉 P0-1（click+submit 双事件去重）、P0-2（占位符注入落 CLI）、快照归因缺陷、P1-4（标题文件名清洗），定格为 recorder 21 例 + distiller 68 例全绿，是全局 492 条测试的两个组成部分。
 
-## 2. 设计决策总表
+**复习法**：先背 §5 必背数字（所有追问最后都落在这些数上）→ 再过 §3 决策速答卡（每张 30-60 秒能说完整）→ 最后 §4 踩坑故事卡（第一张快照归因必须滚瓜烂熟）。时间紧就只背 §5 表 + §4 第一张卡。
 
-| # | 决策 | 为什么 | 考虑过/否决的备选 | 否决理由 | 出处 |
-|---|---|---|---|---|---|
-| D1 | 录制形态选**注入式 JS**（bookmarklet 或 DevTools Snippet 的 content script），零安装 | 演示友好：复制一条 `javascript:` 书签即可在任意同源页录制；事件已落 JSON（stop/getJSON 随时可取），新页面重新注入即可续 | 浏览器扩展形态 | 需要 manifest/加载机制与商店审核，注入式已满足零安装演示（recorder spec §9）；跨文档导航杀死注入 JS 是该形态固有边界，如实记已知限制不解决（recorder plan §2/§5） | recorder plan §2；spec §4.6.3/§9；PLAN §3.1 |
-| D1a | （附注）**Playwright tracing / codegen 作为录制替代**：源文档（recorder plan/spec/review、PLAN §3.1）**均未记录**该备选的显式取舍——未核实。可核实的相近事实是：评测框架用 Playwright **回放动作**驱动录制器（`record2gherkin/evaluation/record_flows.py`），且 PLAN §3.4 用 Playwright codegen selector 脚本仅作**存活率对照基线**，不是录制手段 | — | — | — | PLAN §3.4；evaluation test-report：113；本档案标注"未核实" |
-| D2 | 事件监听用 `document.addEventListener(type, handler, /*capture=*/true)` **事件委托**，单套监听器覆盖全页 | 动态插入的元素天然被覆盖 | 逐元素绑定 + MutationObserver | 需遍历 + MutationObserver，复杂且漏绑（recorder plan §2） | recorder plan §2 |
-| D3 | input 用**定稿制**：只听 `change` + `focusout`，按"元素 + 焦点会话"（`focusin` 开新会话）去重，记最终值 | 一个输入框多按键只落一条最终值事件 | 每 keydown 记一条 | 事件爆炸、无意义；change 与 focusout 双保险覆盖两种结束方式（recorder plan §2）。focusout 是捕获阶段安全的 blur 等价实现（recorder review 契约核对表） | recorder plan §2；spec §4.3 |
-| D4 | 快照采集：每个有效事件入队后 `setTimeout(..., 300)` 延迟抓可见文本，与上一次快照文本集做**差集**得 `assert_texts` | 延迟让点击引发的 DOM 更新先落地；差集保证 assert_texts 是"这次操作**新出现**的文本"，才是有效断言依据 | 全量文本入流 | 体积大、下游无法区分新旧（recorder plan §2） | recorder plan §2；spec §3 |
-| D5 | navigate 捕获：start() 记初始 navigate + patch `history.pushState/replaceState` + 监听 `popstate/hashchange` | 覆盖 SPA 路由；跨文档导航（整页刷新/跳转）使注入 JS 销毁——bookmarklet 形态固有，如实不解决 | — | — | recorder plan §2；spec §4.6 |
-| D6 | `target.name` 五级优先级：aria-label → associated label（`label[for]` → `aria-labelledby` → 包裹型 `closest("label")`）→ placeholder → innerText → title | PLAN §3.1 契约顺序不可改；属性集合与 Hercules `getAccessibleName`（get_detailed_accessibility_tree.py:1050-1087）"同源"，保证蒸馏产物与引擎感知口径一致（该"同源"说法的精度争议见踩坑 K16） | 对齐引擎实际手动链（含 alt/value 级） | 契约是唯一权威，录制器/蒸馏器均遵契约；顺序差异是 PLAN 层既定决策（recorder review 备注 a） | recorder spec §2.1.2；recorder review 备注 a |
-| D7 | bookmarklet 单行化：python 读 recorder.js → IIFE 包裹 → `urllib.parse.quote(payload, safe="")` **全量 URL 编码** → 拼 `javascript:` 前缀 | 全量编码比手写 minify 稳（不会改坏语义）；Chrome 对 bookmarklet 长度上限宽松（>100KB），无需压缩 | 手写 minify / 正则删注释；npm/webpack/esbuild 工具链 | minify 有改坏语义风险；本机无 Node 且引入工具链违背"小而准"（recorder plan §2；spec §6/§9） | recorder plan §2；spec §6 |
-| D8 | 测试形态：pytest + playwright（uv 已有），file:// 打开唯一 fixture → `page.evaluate` 注入 recorder.js 源码 → `page.click/fill` 模拟操作 → `json.loads(getJSON())` 断言 | 与生产注入路径同构（都是 evaluate 注入同一份 JS 源）；录制器不依赖网络/cookie，file:// 下 history.pushState 可用 | 起 HTTP 服务 | 无需（recorder plan §2/§5） | recorder plan §2；spec §7 |
-| D9 | `dom_snapshot` 字段**恒存在、恒为对象**（初始 navigate 为 `{"assert_texts": []}`） | review 必改 1：spec 三处定义互相矛盾（示例 null / §4.6.1 null / 字段表恒存在），实现者无法同时满足；统一后与"整字段不省略"、用例 17 键存在性断言自洽 | 初始 navigate 为 null（旧设计） | 是"无基线"两代设计残留，未收敛（recorder review 必改 1） | recorder spec §2/§3；review 必改 1 |
-| D10 | 快照差集文本**归给触发时刻最新已入队事件**（追加写入、8 条上限），而非调度该快照的事件 | input 在下一次交互的 focusout 时才定稿入队（先于引发 DOM 变化的 click），若按调度事件归因，Then 会出现在状态变化之前，重放必假失败；归给更晚的事件总是安全的（文本在该事件之后持续可见） | 按"调度该快照的事件"归因（原始设计） | 集成冒烟实证产生"Then 早于状态变化"假失败（recorder spec §3 修订；test-report 补记；提交 0ad2075） | recorder spec §3（2026-09-21 修订）；test-report 补记 |
-| D11 | 点空白判定**取严**：target 为 document/html/body 的 click 一律丢弃 | spec §4.2 字面是"且 name 为空才丢弃"，但 body/html 的 innerText 是整页文本，字面实现会把整页文本写成 name，与 §4.7 去噪总表"点空白 → 0 条"矛盾；取最简确定的语义 | 按 spec 字面（name 为空才丢） | 与去噪总表矛盾（recorder test-report 已知问题 1；phase1 P2-3 列为"有意为之的 spec 文字漂移"） | recorder test-report §6.1；recorder.js:351-355 注释 |
-| D12 | 蒸馏输出恒为 **1 Feature 1 Scenario**，骨架措辞统一英文（元素录制名保持原语言）；标题做单行化 + 120 字符截断，**标题行不受事实回查约束** | 消费方是 Hercules `split_feature_file`（1 场景一文件）；标题行不是步骤字面值来源，回查约束只作用于步骤行（distiller spec §2.1/§5.2） | 多 Feature 切分、中文/双语模板 | Out of Scope（distiller spec §8） | distiller spec §2.1/§8 |
-| D13 | 蒸馏三层架构：**规则模板层（纯规则零模型）→ 可选润色层 → 事实回查层（规则层）**；骨架自带一次回查自检（防御性，应恒过） | 核心目标三条刻死推论：规则层不 import LLM 不发网络；任何输入必产合法 feature 绝不抛异常中断；润色是纯加法，出错一律整体丢弃回退骨架。骨架输出的保证不在 prompt 而在回查层 | 让 LLM 直接从事件流生成用例（玩具级上游 prompt 路线） | 对模型能力零依赖是既定设计：PLAN §3.2"确定性优先"，上游 guided 模式 prompt 是玩具级（utils/test_builder.py:13-28） | distiller plan §1/§2；PLAN §3.2 |
-| D14 | 骨架自检失败**不回退、直接抛 `DistillError`**（唯一允许骨架层抛错的场景） | 模板由事实集生成、按构造应恒过；若不过说明校验器/模板有 bug，静默兜底会掩盖 bug（distiller spec §2.5/§5.3）；测试必须覆盖恒过不变量 | 静默回退/兜底 | 会掩盖校验器 bug（distiller spec §5.3） | distiller spec §2.5/§5.3；api.py:39-47 |
-| D15 | click+submit 双事件去重放**规则层（templates）**而非润色层，是规则层唯一例外合并 | 去重是确定性规则、零模型依赖；润色白名单只允许合并 input。契约原本悬空：recorder spec §4.2 写"蒸馏器负责合并"，distiller 润色白名单却不含——phase1 判定为"两份 spec 互相指派、无人落地"的唯一跨模块契约断点 | 放润色层合并；或保留 submit 丢 click | 非确定性、不可测；click 带按钮 name hint 重放定位更稳（distiller spec §2.2；test-report 补记；phase1 P0-1） | distiller spec §2.2；test-report 补记；phase1 P0-1 |
-| D16 | 润色失败**整体回退**，不做部分采用；骨架稿是唯一回退目标 | 部分采用需要逐行可信度判定，复杂且引入新的出错面；骨架永远在手上，`fallback_reason` 记原因即可 | 部分采用润色稿 | distiller spec §5.3 明文"不存在部分采用" | distiller spec §5.3 |
-| D17 | 掩码值：`value == "<masked>"`（实现为 `strip()` 后比较的超集判定）→ 占位符 `{{TEST_DATA:password_{seq}}}`；`test_data_values` 提供真值则填充且真值入事实集；未提供则保留占位符（显式 TODO） | 录制层绝不记录真实密码；占位符不参与事实回查（豁免）；`<masked>` 本身不入事实集（它不是事实） | 把 `<masked>` 当明文写进用例；或把掩码值排除出步骤 | 绝不泄漏敏感值（验收标准 7 机械检查 masked_leak）；`strip()==` 超集是"宁多掩不可漏"的刻意取舍（test-report 已知问题 4） | distiller spec §1.1/§2.3；test-report §4.4 |
-| D18 | 模板静态兜底词 `element`/`field`/`dropdown`/`form` **豁免事实回查**（视为模板常量，不参与校验） | review 必改 1：hint 兜底链末端是写死引号字面值，不在事实集也不在豁免清单 → target 缺失时骨架自检必失败抛 DistillError，直接违反"任何输入恒产合法 feature"；不推荐把它们加进事实集（污染 ground truth 语义） | 把四词加入事实集 | 污染 ground truth 语义（distiller review 必改 1） | distiller spec §5.2；review 必改 1 |
-| D19 | 结构校验用**依赖无关的正则**实现（venv 无 gherkin 解析器、不新增依赖），且**每行先 strip 再锚定/关键词检查** | PLAN §3.2 说"可用 gherkin_helper 已有解析"是"可用"非"必须"，正则校验 + 用例 34 接 `split_feature_file` 冒烟等价细化；strip 是 review 必改 2：LLM 润色稿普遍带缩进，`clean_gherkin_output` 不做缩进归一化，`^` 锚定会把缩进产出系统性判非法 → 润色层在生产上永远回退 | 用 gherkin 解析库 | venv 无解析器，不新增依赖（distiller spec §5.1；review 必改 2） | distiller spec §5.1；review 必改 2 |
-| D20 | 字面值匹配：`norm(L)==norm(F)` **或 `norm(L) ⊆ norm(F)`**（子串方向 L⊆F），空白归一化、**大小写敏感**；转义契约 `escape_literal`（先 `\` 后 `"`）与 `unescape_literal` 互逆 | 允许 L⊆F 是为容忍润色截取（断言长句取短语）；空白归一化与下游 `serialize_feature_file` 的空格折叠兼容（gherkin_helper.py:102-134） | 词序子集匹配（非连续词组也算命中） | test-report 已知问题 1：按 §5.2 严格子串实现；若评测期误杀真实润色稿再考虑放宽（会削弱硬闸，需评审） | distiller spec §5.2/§2.4；test-report §4.1 |
-| D21 | 断言存活检查方向固定：**润色字面值 ⊆ 骨架 Then 字面值**（只许缩短不许加长） | review 建议 3：⊆ 方向的唯一合理解读；双向子串会把"润色稿加长断言"也放行，削弱硬闸（factcheck.py dropped_assertions docstring 明注） | 双向子串匹配 | 削弱硬闸（distiller review 建议 3） | distiller review 建议 3；factcheck.py:141-157 |
-| D22 | Scenario/Feature 标题做**文件名安全清洗**：仅保留 `[字母数字下划线、CJK、空格、连字符]`，其余连续段折叠为单个 `_`，首尾 `_`/空格剥除，清洗后为空回退默认标题 | 标题会被上游用作 JUnit 文件名（gherkin_helper.py:70-71 只 `replace(' ','_')` 无安全化），`Recorded flow on http://...` 中的 `://` 产生的 `//` 被当作目录分隔符导致写文件失败（pilot002 复盘，阶段 1 分析 P1-4，提交 7ce6c95） | 上游 split 前 sanitize（评测框架做） | 落在蒸馏器源头更稳，规范固化在 distiller spec §2.1（spec 原文） | distiller spec §2.1；templates.py:52-59；phase1 P1-4；7ce6c95 |
-| D23 | Polisher 协议：单方法 `async polish(skeleton_text, events) -> str`；`DefaultPolisher` 走 litellm 弱模型档（role key `distiller_polish`）、温度 0、总尝试 ≤2 次、单次超时 60s；异常向上抛由 api 层捕获降级 | 异步便于接 litellm；协议实现自身不做回退决策（职责分离）；弱模型档即可因骨架是规则出的（PLAN §3.3 路由表）；litellm/gherkin_generator 均函数内惰性 import，import 本模块不触网络 | 协议内自带回退 | 违反职责分离（polisher.py docstring） | distiller plan §3；spec §4.1；polisher.py:14-18/119-138 |
-| D24 | 润色 prompt 四条白名单 + 硬约束：只许合并"连续且同一目标字段"的 input（保留最终值）、改措辞、改标题；禁止增删 Then、禁止动任何引号字面值、禁止改顺序与关键词语义、恰好 1 Feature 1 Scenario、每行顶格、只输出 feature 本体 | 润色是纯加法，prompt 是第一道软约束，回查是硬闸兜底；"顶格输出"是 review 必改 2 后补的双保险（校验端 strip 才是必须） | 无约束自由润色 | 会丢断言/编字面值（distiller spec §4.2；polisher.py SYSTEM_PROMPT） | distiller spec §4.2；polisher.py:21-35 |
-| D25 | 润色产物**四道闸依次执行，任一失败整体丢弃**：① `clean_gherkin_output` 清洗后非空（空 → `polish_empty`）② 结构校验（→ `syntax_invalid`）③ 事实回查（→ `fact_check_failed:<字面值列表>`）④ 断言存活（→ `assertion_dropped:<字面值列表>`）；另有 polish 抛异常 → `polish_error:<ExcType>`；原因中的字面值列表最多列 5 个 | 顺序由廉价到昂贵、由格式到语义；五条失败路径全部收敛为"回退骨架 + fallback_reason"（distiller spec §3/§4.3/§5.3） | — | — | distiller spec §3/§4.3/§5.3；api.py:50-67 |
-| D26 | 骨架自检的**检查动作放在 api 层执行**（templates.py 保持纯函数、不 import api 的异常类型） | 避免循环依赖（templates → api）；对外可见行为与 spec 一致（DistillError 仍是唯一主动抛错路径） | templates 里直接抛 DistillError | 会造成 templates→api 循环依赖（test-report 已知问题 4，代码注释标注） | distiller test-report §4.4；api.py:39-47 |
-| D27 | 所有字符串字段**空串/全空白一律视为缺失**走 fallback 链（`optional_text`） | review 建议 2：`page_title=""`、`url=""`、`target.name=""` 是"缺失"还是"原样填充"未言明；按建议落地最简确定性行为 | 空串原样填充 | 会产出空字面值步骤（distiller review 建议 2；events.py:25-36 docstring） | distiller review 建议 2；events.py optional_text |
-| D28 | P0-2 落地：CLI `generate` **两遍蒸馏**——第一遍 `polisher=None` 出骨架提取所需占位符键集，第二遍只喂 `needed ∩ provided` 的 `test_data_values` 终蒸馏；`--test-data` JSON object，blank/bool/null 视为未提供（与蒸馏器同规则），object/array 值为硬错误；missing 键警告 `missing_test_data:<key>` 并保留占位符提示人工填充重跑，多余键警告 `unused_test_data:<key>` | phase1 P0-2：`{{TEST_DATA:password_<seq>}}` 在 Hercules 侧没有任何机械消费者（全仓 grep 无替换逻辑，static_data_loader 只整块注入文件内容），带密码流程重放成败取决于 LLM 猜测；方案取建议 (a) 蒸馏时经既有 `test_data_values` 参数填真实值 | 方案 (b)：约定命名 test_data 文件靠 LLM 推断 | 不确定性大，不推荐作主路径（phase1 P0-2 建议） | phase1 P0-2；cli.py:303-404；STATUS.md D2 |
+## 2. 60 秒主线
 
-## 3. 关键实现细节
+（被要求"讲讲录制和蒸馏怎么设计的"时，背这一段——）
 
-### 3.1 录制器（record2gherkin/recorder/）
+"这条链路分两步。第一步是录制器：一个注入进普通页面的单文件 JS，用户从书签栏点一下就开始录，不用装任何扩展。它在 document 上用捕获阶段的事件委托统一拦截点击、输入、下拉、提交这些动作，把'人工点一遍页面'忠实记成一份 JSON 事件流，一共五类事件，每条八个字段；元素定位全靠语义——name 按五级优先级取（aria-label、关联 label、placeholder、可见文本、title），页面上有同名元素就再加序号消歧，全程不存任何 selector。密码在采集那一刻就写成掩码，真实值绝不落盘。另外每个有效事件入队后延迟 300 毫秒抓一次页面可见文本，跟上一次快照做差集，只记'这次操作新出现的文本'——这就是后面 Then 断言的素材，所以断言不来自想象，来自录制时的真实页面。第二步是蒸馏器：把事件流确定性翻译成 Gherkin，三层结构——规则模板层零模型依赖出骨架，恒为一 Feature 一场景、措辞全英文；LLM 只做可选的润色，是纯加法；最底下事实回查层兜底，产物里每个引号字面值必须能在录制事实集里找到原文，润色稿要过四道闸、任何一道不过就整体丢弃回退骨架，不存在部分采用。所以最终产物的正确性对模型能力零依赖，同样输入跑两次输出逐字节相同。这套东西最后定格在 recorder 21 条、distiller 68 条测试全绿，是全局 492 条测试里的两个组成部分。"
 
-**交付物形态**：`recorder.js` 单文件 IIFE（test-report 时点 561 行 / 16458 字符；快照归因修复 0ad2075 之后现工作区为 575 行 / 18218 字符），零依赖零构建（验收 `grep -c "require(\|import "` = 0）；`build_bookmarklet.py` 纯标准库 47 行（仅 re/sys/urllib.parse/pathlib），产出 `bookmarklet.txt`（test-report 时点 32293 字符，现 34117 字符，无尾随换行——书签内容需与 payload 逐字节一致）。源码首行即 IIFE，`build_bookmarklet.py` 的 `IIFE_PATTERN`（`^\(\s*function\s*\(`）命中则原样返回，保证"解码后与源码逐字节一致"（用例 20）。（出处：recorder test-report §1/§4.2/§4.4；build_bookmarklet.py:22-29/39-40）
+## 3. 决策速答卡
 
-**顶层结构与事件 schema（8 键）**：`getJSON()` 返回 `{session, events}` JSON 字符串（2 空格缩进）。`session = {started_at: ISO 8601 UTC, origin: location.origin}`（均 start() 时刻）。每条事件 8 个契约字段：
-- `seq`：int，入队即分配（`(eventSequence += 1)`），从 1 起跨类型严格递增不重置；
-- `ts`：int，epoch 毫秒，取**监听器收到事件**的时刻（`Date.now()`），非入队时刻；
-- `type`：枚举 `navigate/click/input/select/submit`，不新增；
-- `url`：事件时刻 `location.href`（navigate 取跳转后 URL）；
-- `page_title`：事件时刻 `document.title`，可为空串；
-- `target`：Target 对象或 null（navigate 恒 null；submit 指向 `<form>`）；
-- `value`：string/null，仅 input/select 有值（规则见下）；
-- `dom_snapshot`：恒存在恒为对象，事件入队时即为 `{"assert_texts": []}`，300ms 后**原地填充**。
-（出处：recorder spec §1/§2；recorder.js:308-326；test-report §5）
+### 卡 1 录制形态选注入式 JS，不做浏览器扩展
+- 面试官会怎么问：「为什么用注入式 JS？不用浏览器扩展或 Playwright 录制吗？」
+- **30-60 秒回答**：录制形态选了注入式 JS：要么 bookmarklet（一条 `javascript:` 开头的收藏夹书签，点击即注入脚本），要么 DevTools Snippet，复制进去就能在任意同源页面开始录制，零安装、演示友好；事件随时通过 getJSON 拿到 JSON，跳到新页面重新注入一次就能续录。否决了浏览器扩展形态：需要 manifest、加载机制甚至商店审核，注入式已经满足零安装演示。Playwright 这个备选我会诚实说：源文档里没有它作为录制手段的正式取舍记录；可核实的是两件事——评测框架里 Playwright 只是用来回放动作、驱动录制器录制的，codegen selector 脚本只当存活率对照基线，都不是录制方案。这个形态有一个如实写进已知限制的边界：跨文档导航（整页刷新或跳转）会把注入的 JS 一起销毁。SPA（单页应用，改 URL 不整页跳转）的路由靠 patch `history.pushState/replaceState` 加监听 `popstate/hashchange` 全覆盖，start() 时先记一条初始 navigate；而 MPA（多页应用，整页跳转）场景做的是"干净退出"设计——不做跨文档续录、不做会话持久化和心跳，如实记录到导航为止，导航前的事件已经能取回，新页面人工重新注入。这是形态的固有边界，我们选择如实声明而不是硬解决。
+- 追问预案：「整页跳转后的页面就录不到了怎么办？」→ 对，bookmarklet 形态固有，写进了计划风险表和已知问题；换扩展形态能解决但要付安装成本，演示场景不值。「为什么不顺带做断言自动生成？」→ 录制层职责是忠实捕获，断言素材（assert_texts）已经给到，智能生成是下游的事。
 
-**Target 对象（7 字段）**：
-- `tag`：`tagName.toLowerCase()`；
-- `role`：显式 `role` 属性优先 → 隐式映射表（最小集：`a[href]`=link；`button`、`input[type=submit|button|reset]`=button；文本类 input + `textarea`=textbox；checkbox/radio 同名；`select`=combobox；其余=generic）→ `"generic"`。注意 review 建议 3a：该词表与 Hercules `getRole`（:1098-1148）不同（select: combobox vs listbox；search: textbox vs searchbox 等），role 为 ARIA 近似词表，定位以 name/hint 为主；
-- `name`：五级优先级（D6），清洗 = 首行、trim、压缩连续空白、≤200 字符（`NAME_MAX_LENGTH=200`）；全部未命中 → 空串（此时 ordinal 必为 null）；
-- `testid`：`data-testid`，无则 null；
-- `id`：`element.id`，空串视为 null；
-- `ordinal`：对当前元素算出 name 后，用 `document.querySelectorAll(tag)` 过滤出"同一套 name 逻辑算出的 name 相同"的元素集合，当前元素在集合中的 1-based 序号；**集合长度 >1 才写**，否则 null；不做 CSS path/nth-of-type（定位交给下游语义引擎）；
-- `form_label`：仅 input/textarea/select 有值，关联顺序 `label[for]` → `aria-labelledby`（多 id 取第一个可解析元素）→ 包裹型 `closest("label")`，取不到 null。
-（出处：recorder spec §2.1；recorder.js:68-194；review 建议 3a/已知问题 3）
+### 卡 2 bookmarklet 打包：全量 URL 编码，不做 minify
+- 面试官会怎么问：「bookmarklet 是怎么打包的？为什么不做压缩混淆？」
+- **30-60 秒回答**：打包脚本是一个 47 行的纯标准库 Python（只用了 re、sys、urllib.parse、pathlib），流程四步：读 recorder.js 源码 → 用 IIFE（立即执行函数包裹，避免污染页面全局变量）包一层 → 全量 URL 编码 → 拼上 `javascript:` 前缀产出 bookmarklet.txt。编码用全量 quote 而不是手写 minify，因为 minify 有改坏语义的风险，为一个演示工具不值当；Chrome 对 bookmarklet 长度上限非常宽松（10 万字符以上），也根本不需要压缩。否决过 npm/webpack/esbuild 工具链：本机没有 Node，为一个五百多行的脚本引入构建链违背"小而准"。产物规模：recorder.js 交付时点 561 行 / 16458 字符，快照归因修复后 575 行 / 18218 字符；bookmarklet.txt 从 32293 字符长到 34117 字符，离上限余量巨大。还有一条机械保证：源码首行本身就是 IIFE，打包脚本检测到就直接原样返回，保证解码后与源码逐字节一致——专门有一条用例在验这个。验收上还有个小细节：`javascript:` 前缀实际是 11 个字符，spec 曾误写"首 10 字符"，实现按完整前缀断言并明注了差异。
+- 追问预案：「书签内容会不会因为换行坏掉？」→ 产物无尾随换行，书签内容与 payload 逐字节一致，这是验收标准之一。
 
-**value 字段规则**：文本类 input/textarea 最终值原样（不 trim 内部空白、去首尾换行——该规则仅在 textarea 可观测，`<input type=text>` 的 value sanitization 本身去换行）、上限 500 字符（`INPUT_VALUE_MAX_LENGTH=500`）；password 恒字面量 `"<masked>"`（`MASKED_VALUE`），绝不记录真实值，但 name/form_label/ordinal 照常采集供下游生成 test_data 引用；checkbox/radio = `"true"/"false"`（checked 状态）；file 恒 `"<file>"`（`FILE_VALUE`，文件名不入流）；select = 被选中 option 的 innerText（与 name 同一套清洗截断，≤200 字符）；navigate/click/submit = null。未定义值规则的类型（range/color/hidden/image 等）不产生 input 事件（已知问题 4，最简确定性行为）。（出处：recorder spec §2.2；recorder.js:53-58/382-419；test-report §6.4/§6.8）
+### 卡 3 事件委托 + 只读监听
+- 面试官会怎么问：「动态插入的元素怎么都能录到？」
+- **30-60 秒回答**：事件监听用事件委托——不在每个元素上绑监听器，而是在 document 上挂一套捕获阶段（capture 阶段，事件从外向内传播的最早一环）的监听器统一拦截。这样动态插入的元素天然被覆盖，不用遍历 DOM。否决过"逐元素绑定 + MutationObserver 补绑"：又要遍历又要观察器，复杂还容易漏绑。所有 handler 只读，绝不 preventDefault、绝不 stopPropagation——录制器绝不能干扰页面本身的行为，这是底线。停止录制时全部监听器按捕获阶段配对移除，同时恢复被包装的原生 history 方法、取消未决的快照定时器，已入队的事件保留。公开 API 五个方法：start / stop / getJSON / status / copy；录制中重复 start 是 no-op 返回 false；幂等注入——脚本每次执行先用 try/catch 包着停掉旧实例，再重定义 `window.R2GRecorder` 为全新停止态实例，旧实例停止失败也不影响新实例。未开始时 getJSON 返回空 session 加空事件数组、stop 返回 false；getJSON 输出是 2 空格缩进的 JSON 字符串。
+- 追问预案：「为什么必须捕获阶段？」→ 捕获阶段先于页面自己的 handler 触发，能拦到全页所有事件，也是 blur 这类不冒泡事件能被 focusout 等价替代的前提。
 
-**input 定稿制（focusSessions WeakMap）**：`focusin` 对文本类字段建会话 `{initial: 当前值, recorded: false}`；`change`/`focusout` 触发 `finalizeTextInput`：会话已 recorded → 跳过（同会话只记一条）；值 == focusin 初值 → 不记（未修改的 focus+blur 零事件）；无会话的后备规则（如注入前已聚焦）：值非空记一条、空值不记（已知问题 6）。checkbox/radio 走 `change`（不依赖 focusout）；`<select>` 的 change 走独立 select 分支（互斥，不再产生 input）。（出处：recorder spec §4.3/§4.4；recorder.js:359-423；test-report §6.6）
+### 卡 4 input 定稿制：多按键只落一条最终值
+- 面试官会怎么问：「一个输入框打二十个字符，你们记二十条事件吗？」
+- **30-60 秒回答**：不，input 用"定稿制"：只听 change 和 focusout 两个"结束信号"，按"元素 + 焦点会话"去重——focusin 给这个输入框开一个新会话（用 WeakMap 存会话，不阻止元素被垃圾回收），change 或 focusout 触发定稿，同一会话只落一条最终值事件；如果值和 focusin 时的初值一样（用户只是点了点没改），一条都不记。这样一次输入过程不管敲多少键只有 1 条事件，未修改的 focus+blur 是 0 条。否决了每个 keydown 记一条：事件爆炸、全是无意义中间态。为什么特意用 focusout 而不是 blur？blur 不冒泡、捕获阶段收不到，focusout 是捕获阶段安全的等价实现；change 和 focusout 双保险，覆盖两种输入结束方式。两个边界：注入前已经聚焦的输入框没有会话，走后备规则（值非空记一条、空值不记）；checkbox/radio 走 change 不依赖 focusout，select 的 change 走独立的 select 分支、和 input 互斥——一次下拉选择不会既产 input 又产 select。
+- 追问预案：「focusin 记初值有什么用？」→ 用来判断"值改没改"，没改就不记，这是去噪的关键一环。
 
-**dom_snapshot 采集（assert_texts）**：
-- 触发：每个有效事件入队后 `setTimeout(..., SNAPSHOT_DELAY_MS=300)`；采集期间又来新事件则各自独立调度；`stop()` 取消未决定时器；
-- 归因（2026-09-21 修订，D10）：快照触发时刻，差集文本归给 `events[events.length-1]`（当时最新已入队事件），追加写入、遵守 8 条上限；无新增文本则早退（注意：`collectNewTexts()` 在返回前已把 `lastSnapshotTexts` 滚动更新为当前集合，即基线照常前滚）；
-- 可见文本候选元素三条件：①可见（`getBoundingClientRect()` 宽高均 >0，`visibility` 为 visible，自身及祖先 `display` 非 none）②叶子文本元素（直接 TEXT_NODE 拼接 trim 非空，且不含含文本的子元素）③标签不在排除集 `SCRIPT, STYLE, NOSCRIPT, TEMPLATE, OPTION, SELECT, INPUT, TEXTAREA, TITLE, SVG`；
-- 清洗与截断：压缩连续空白（含换行）为单空格、trim、≤120 字符（`ASSERT_TEXT_MAX_LENGTH=120`）；
-- 差集：`当前集合 − 上次集合`，按 DOM 顺序取**最多 8 条**（`ASSERT_TEXT_MAX_COUNT=8`）；
-- 基线：`start()` 时抓一次初始可见文本作基线（不写入任何事件）→ 首个 navigate 的 assert_texts 恒为空数组（加载即存在的文本不构成断言依据）；
-- 采集是全量遍历（`querySelectorAll("*")` + 逐元素布局读），无节流/增量（spec §9 Out of Scope，已知问题 10）。
-（出处：recorder spec §3；recorder.js:196-304；test-report §6.10）
+### 卡 5 契约上限与哨兵值（一张卡背完所有字段规矩）
+- 面试官会怎么问：「事件流会不会爆炸？每个字段都什么规矩？」
+- **30-60 秒回答**：一套写死在录制器里的上限和哨兵值。事件一共五类（navigate/click/input/select/submit，枚举不新增），每条 8 个契约字段（seq/ts/type/url/page_title/target/value/dom_snapshot），target 7 个字段（tag/role/name/testid/id/ordinal/form_label），session 2 个字段（started_at 和 origin，都取 start() 时刻）。长度上限四档：元素 name 200 字符（取首行、trim、压缩连续空白）、文本输入值 500 字符（去掉首尾换行——这条规则只在 textarea 上可观测，input 元素浏览器本身就去换行）、select 选中项文本 200 字符（与 name 同一套清洗）、断言文本 120 字符且每个事件最多 8 条。哨兵值三个：password 恒为 `"<masked>"`、file 恒为 `"<file>"`（连文件名都不入流）、checkbox/radio 记 `"true"/"false"`。没有定义取值规则的类型（range/color/hidden/image 这些）干脆不产生 input 事件——最简确定性行为。字段细节：seq 从 1 起跨类型严格递增不重置；时间戳取监听器收到事件的时刻而非入队时刻；navigate 的 target 和 value 恒为 null，submit 的 target 指向 form 元素；page_title 可为空串。dom_snapshot 字段恒存在、恒为对象，事件入队时先是个空数组对象、300ms 后原地填充——这一点当年 spec 三处定义打架，统一成现在这样，故事见踩坑卡。
+- 追问预案：「为什么 select 的上限跟 name 一样是 200？」→ 它取的就是被选中 option 的可见文本，和 name 走同一套清洗截断逻辑，天然同上限。
 
-**去噪总表**：hover/mousemove/scroll/键盘事件不记录；一次输入过程（多按键）→ 1 条 input 仅最终值；未修改值的 focus+blur → 0 条；点空白（body/html/document）→ 0 条；重复 navigate（与上一条 navigate URL 相同则丢弃——实现上不限 spec 字面的"同 tick"，phase1 P2-3 列为有意漂移）→ 1 条；双击 → 2 条 click（忠实记录，蒸馏器负责合并——但注意 phase1 未将其列为必改，双击合并不在已实现范围）；submit 按钮点击 → click + submit 各 1 条（忠实记录）。双击产生 2 条 click 是 Chromium 原生事件流（test-report §5 手工验证项）。（出处：recorder spec §4.7；test-report §5/§6）
+### 卡 6 target 语义：name 五级优先 + ordinal 消歧
+- 面试官会怎么问：「录下来的元素，执行时怎么保证重新找得到？」
+- **30-60 秒回答**：靠语义不靠 selector。target.name 按 PLAN 契约的五级优先级取：aria-label → 关联 label（label[for] → aria-labelledby → 包裹型 label）→ placeholder → innerText → title，全部未命中才是空串。页面上有同名元素时（经典例子是两个 Delete 按钮）用 ordinal 消歧：对当前元素用同一套 name 逻辑算出全页同名集合，取当前元素在集合里的 1-based 序号——而且集合长度大于 1 才写，避免无意义序号；蒸馏时序号大于 1 就在步骤尾部追加 "(occurrence n)"，手造数据 ordinal 为 1 也不追加，两端防御一致。role 是 ARIA 近似词表的最小集（链接、按钮、文本框、下拉 combobox 这些），这里要诚实：它和引擎自己的 getRole 词表并不相同（比如 select 我们算 combobox、引擎算 listbox），所以定位以 name 加 hint 为主、role 只是措辞辅助。name 与引擎可访问名"同源"这个说法有精度争议——引擎手动链其实不含 label 关联——我们如实承认，评测期用 name 命中率数据说话，故事见踩坑卡。另外刻意不做 CSS path、nth-of-type 这类结构定位，全部交给下游语义引擎现场感知 DOM——这正是"UI 改版不挂"的根源。
+- 追问预案：「ordinal 为什么大于 1 才记？」→ 单元素记序号是纯噪声；录制端只在同名集合大于 1 时写，蒸馏端也只在大于 1 时追加，口径一致。「testid 存了为什么不用它定位？」→ 采集了但全链路零消费，作为透传字段保留——它是将来低成本增强重放稳定性的候选，但要动 spec，先记录。
 
-**navigate 与 MPA 边界**：start() 立即产生 seq=1 初始 navigate（target/value null，dom_snapshot 为空数组对象）；SPA 路由靠 patch `history.pushState/replaceState`（包装原函数，调用后 URL 变化才产生）+ `popstate/hashchange`；**跨文档导航**（整页跳转/刷新）使注入 JS 随文档销毁——导航后页面不被记录，导航前事件已可 getJSON() 取回，新页面重新注入即可；这是 MPA（多页应用）场景的**干净退出设计**：录制器不尝试跨文档续录（不做会话持久化/心跳），而是"如实记录到导航为止 + 人工重新注入"，作为 bookmarklet 形态固有已知限制写入 plan 风险表与已知问题 9。（出处：recorder spec §4.6；plan §2/§5；test-report §6.9）
+### 卡 7 快照差集：300ms 延迟 + 只记新增文本
+- 面试官会怎么问：「assert_texts 是什么？为什么是差集？300ms 怎么定的？」
+- **30-60 秒回答**：assert_texts 是 Then 断言的素材。每个有效事件入队后，用 setTimeout 延迟 300 毫秒抓一次页面可见文本，与上一次快照的文本集做差集，只保留"这次操作新出现的文本"。延迟 300 毫秒是让点击引发的 DOM 更新先落地；做差集是因为全量文本入流体积大、下游也没法区分新旧——而"加载即存在的文本"不构成断言依据，所以 start() 时先抓一次全页可见文本当基线（不写进任何事件），首个 navigate 的 assert_texts 恒为空数组。可见文本判定三条件：元素可见（有布局尺寸、visibility 非隐藏、自身和祖先 display 非 none）、是叶子文本元素、标签不在排除集里——script/style/noscript/template/option/select/input/textarea/title/svg 十个标签。每条压缩空白后截 120 字符，按 DOM 顺序最多取 8 条；采集期间又来新事件就各自独立调度；没有新增文本就早退，但基线照常前滚。这是全量遍历、无节流无增量——性能优化明确写在 Out of Scope，轮播图、计时器这类噪声 MVP 接受，由下游事实回查兜底。快照文本归给哪个事件，这里面有个我亲手修过的大坑，见踩坑卡第一张。
+- 追问预案：「机器回放也要等 300ms 吗？」→ 评测侧机器回放动作间隔定为 450 毫秒——300 毫秒快照窗口加落地余量，这是两个录制器决策在下游的量化推论，见 §5。「为什么不节流？」→ MVP 目标是正确，性能优化在 Out of Scope，实测规模下不构成瓶颈。
 
-**公开 API 与幂等注入**：`window.R2GRecorder.{start, stop, getJSON, status, copy}`；start 已在录制中 → no-op 返回 false；stop 卸载全部监听器（capture=true 配对移除）+ 恢复原生 `pushState/replaceState` + 取消快照定时器，已入队事件保留；status 返回 `{recording, event_count}`；copy 走 `navigator.clipboard`，失败 false（仅返回类型被用例断言，已知问题 7）。幂等注入：IIFE 每次执行先 `stop()` 旧实例（try/catch 包裹，旧实例停止失败不影响新实例），再重定义 `window.R2GRecorder` 为全新停止态实例。补充行为（手工脚本验证，不在 20 条用例内）：getJSON() 在 start() 前返回 `{"session": null, "events": []}`；stop() 未开始时返回 false。所有 handler 只读，绝不 `preventDefault/stopPropagation`。（出处：recorder spec §5；recorder.js:498-575；test-report §5/§6.2/§6.7）
+### 卡 8 去噪与忠实记录的分工
+- 面试官会怎么问：「录制怎么平衡'忠实'和'干净'？哪些记哪些不记？」
+- **30-60 秒回答**：原则是"人无意义的动作不记，机器的真实事件忠实记"。不记的：hover/mousemove/scroll/键盘事件；一次输入过程只记 1 条最终值（定稿制）；没改值的 focus+blur 记 0 条；点空白——target 是 document/html/body 的 click 一律丢弃。点空白这条当年 spec 两个字段打架：字面规则是"name 为空才丢"，但 body 的 innerText 是整页文本，字面实现会把整页文本写成 name，跟去噪总表"点空白记 0 条"直接矛盾——实现取严一律丢弃，代码注释和测试报告双处留痕（详见踩坑卡）。重复 navigate（与上一条 URL 相同）丢弃，实现按"和当前页面 URL 相同"判定，比 spec 字面的"同 tick"更宽。忠实记的：双击记 2 条 click——Chromium 原生事件流就是这样，语义合并是蒸馏器的事（但双击合并不在已实现范围，属于已知边界）；点 submit 按钮忠实记 click + submit 各 1 条，去重放蒸馏器做（详见踩坑卡 P0-1）。还有个刻意的透传取舍：file 输入的 `"<file>"` 哨兵按普通值进步骤，产出 `When I enter "<file>"` 这种不可执行步骤——评审曾建议写死特殊处置，最终按普通值透传，判定是"输出合法、不阻塞"，评测数据里出现该步骤就判 N/A。
+- 追问预案：「为什么双击不在录制端合并？」→ 录制层职责是忠实、语义合并是蒸馏层职责，分工干净；这条合并不在当前实现范围，如实当边界讲。
 
-**生产环境约束（测试侧同构）**：测试经 conftest 的 `browser`（session 级）+ `recorder_page`（function 级）fixture 注入；`_helpers.py` 的 `validate_event_stream` 是 schema 校验复用入口（spec §8 验收第 3 条要求手动 bookmarklet 流程复用同一校验函数，实际以等价自动化验证——见 K13）；`wait_for_snapshot` 等 `SNAPSHOT_DELAY_MS + 200 = 500ms` 让快照落地。（出处：recorder spec §7/§8；test-report §4.3；_helpers.py:50-52）
+### 卡 9 蒸馏三层架构与"任何输入恒产合法 feature"
+- 面试官会怎么问：「蒸馏为什么分三层？为什么骨架层零 LLM？」
+- **30-60 秒回答**：三层：规则模板层（纯规则、零模型、不发网络）→ 可选 LLM 润色层 → 事实回查层（也是纯规则）。这是核心目标三条刻死的推论：一，规则层不 import LLM、不发网络——events/templates/factcheck 三个骨架模块有负向 grep 的机械检查证明零模型依赖；二，任何输入必产合法 feature、绝不抛异常中断；三，润色是纯加法，出错一律整体丢弃回退骨架。否决过"让 LLM 直接从事件流生成用例"：上游引擎 guided 模式的 prompt 是玩具级的，"确定性优先、对模型能力零依赖"是既定设计。输出恒为 1 Feature 1 Scenario、骨架措辞统一英文（元素录制名保持原语言），因为消费方是 Hercules 的 split_feature_file——一个场景一个文件；多 Feature 切分、中文模板都在 Out of Scope。最后一条防线：骨架自检失败不回退、直接抛 DistillError——这是全链路唯一主动抛错路径。道理是：模板由事实集生成、按构造应恒过，自检失败只可能是校验器或模板有 bug，静默兜底会掩盖 bug。一个实现细节：自检的检查动作放在 api 层执行，让 templates 保持纯函数、不 import api 的异常类型，避免循环依赖，对外行为不变。容错口径也说一下：输入 JSON 文件本身解析失败抛 DistillError——"输出永远合法"指的是生成逻辑对任意合法解析结果产出合法 feature，文件级错误不在此范围。
+- 追问预案：「蒸馏器明确不做哪些？」→ 多 Scenario、中文模板、复杂断言推理、数据抽取、引擎侧 test_data 自动注入、模型路由调优，全部写进 Out of Scope。「事件流是空的怎么办？」→ 仍产合法空骨架加 warning，属于"宁出合法骨架不抛错"的宽松分支。「代码结构？」→ 五个模块：events 277 行（解析归一化 + 事实集）、templates 156 行（规则模板）、factcheck 205 行（回查）、polisher 159 行（协议 + 实现）、api 122 行（编排），包出口 re-export 6 个符号。
 
-### 3.2 蒸馏器（record2gherkin/distiller/）
+### 卡 10 模板映射与 hint 兜底链
+- 面试官会怎么问：「事件具体怎么变成步骤？元素找不到名字怎么办？」
+- **30-60 秒回答**：按 seq 顺序映射，每个事件先输出自身步骤、再输出它 assert_texts 对应的 Then；首个 navigate 用 Given（"I am on the page"），其余全 When/Then。五类事件各一句模板：navigate 后续是 "I navigate to"；click 是 "I click on the {hint} {role}"；input 是 "I enter {value} in the {hint} field"；select 是 "I select {value} from the {hint} dropdown"；submit 是 "I submit the {hint} form"。hint（定位提示词）走兜底链，比如 click 是 target.name → form_label → id → tag → 兜底词 "element"，各类型链略有差异；role 槽不加引号、也不参与事实回查。Feature 标题取 origin、Scenario 标题取第一个事件的 page_title，都缺失就回退默认标题。几个确定性细节：url 缺失先退到 session.origin，再缺就整条事件连它的 assert_texts 一起跳过并记 warning（实现比 spec 字面"跳过该事件"更严，合并分析记录在案）；空值步骤照样生成（引号里空串）加 warning，不静默丢；Then 文本跨场景去重——同一文本只在首次出现处生成、保持首次顺序；值填充时掩码换占位符或真值，转义先反斜杠后引号，换行制表符折叠成单空格。规则层不做任何合并、省略、改写——连续 input、重复 click 都原样逐步输出，唯一例外是 click 后紧跟 submit 的去重（下一张卡）。
+- 追问预案：「submit 的模板是计划里就有的吗？」→ 不是，总计划的映射表没覆盖 submit，这是设计文档里的补充定义，评审时和录制器契约逐条对齐过——没有静默漂移。「navigate 的断言为什么跟着一起跳过？」→ 断言挂在事件下，事件没 url 就没有步骤可挂，一起跳过是最一致的行为；录制器 url 恒有值，实际只有手造数据会命中。
 
-**模块与红线**：`events.py`（277 行，解析归一化 + 事实集）、`templates.py`（156 行，规则模板）、`factcheck.py`（205 行，字面值提取/结构校验/回查/回退判定）、`polisher.py`（159 行，协议 + DefaultPolisher + prompt）、`api.py`（122 行，公开 API + 自检 + 回退编排）、`__init__.py` re-export 六个符号。骨架路径零模型红线：三模块（events/templates/factcheck）不 import litellm/网络模块（验收标准 4 的负向 grep 机械检查，exit=1 无命中；正向 import 证据：events.py 仅 __future__/re/dataclasses/typing，templates.py 另依赖 distiller 内部模块，factcheck.py 同）；templates.py 引 factcheck.escape_literal 是转义契约唯一实现点（§2.4 与 §5.2 互逆），仍是纯规则模块。（出处：distiller test-report §1/§3 命令 B）
+### 卡 11 事实回查与结构校验的精确规则
+- 面试官会怎么问：「事实回查的匹配规则精确是什么？为什么允许子串、方向朝哪边？」
+- **30-60 秒回答**：回查的对象是步骤行里引号内的字面值——用正则提取并做转义还原（转义契约是先反斜杠后引号，提取时逆操作互逆还原，未知转义保留原文）；Feature/Scenario 标题行和注释行不是字面值来源，标题行不受回查约束。匹配规则：字面值 L 算 grounded，当且仅当存在事实 F 使规范化后相等，或 L ⊆ F——规范化是空白归一化（连续空白折叠、去首尾），大小写敏感。允许"产物 ⊆ 事实"这个方向是为了容忍润色截取：断言长句允许只取短语。豁免三条款：TEST_DATA 占位符（必须占满整个字面值才算）、空串、四个模板兜底词 element/field/dropdown/form。为什么兜底词豁免？它们是模板常量不是录制事实，不豁免的话 target 缺失的合法输入必然自检失败抛错——这是评审拦下的坑，见踩坑卡。断言存活检查是另一道闸，方向固定"润色 ⊆ 骨架"——只许润色稿把断言缩短、不许加长，双向匹配会把加长断言也放行、削弱硬闸。事实集在模板生成之前就从事件流构建、与骨架文本无关，共六组：urls、values、hints、assertions、other（ordinal/tag/role/id/page_title 这些）、caller_values（调用方提供的 test_data 真值——填充后的值也是事实）。结构校验用依赖无关的正则实现——虚拟环境里没有 gherkin 解析器、不新增依赖；计划文档说"可用 gherkin_helper 已有解析"是"可"不是"必须"，另有用例接真实拆分函数做冒烟等价验证。校验规则：每行先 strip 再检查（这是防误杀的关键，见踩坑卡）；首个非空非注释行必须以 Feature: 开头；全文恰 1 个 Feature、恰 1 个 Scenario（忽略大小写）；其余每行必须以 7 个关键词之一开头（Feature/Scenario/Given/When/Then/And/But）；空行和 # 注释行忽略。还有一条断言体积的警戒线：单事件断言超过 20 条才考虑截断策略——当前只去重不去量，而且这条线大于录制端单事件 8 条的上限，正常录不出超量。
+- 追问预案：「子串匹配会不会太严、误杀真实润色稿？」→ 非连续词组确实不算命中，这是刻意的：严格子串保硬闸强度，评测期若有真实误杀再评审放宽成词序子集——放宽会削弱硬闸，要走评审。「空串字面值为什么算过？」→ 豁免条款之一，录制端空值步骤仍生成，不能让它把合法产物卡死。
 
-**解析归一化（events.py）**：输入为 dict（含 session/events）或裸 list（session 视为 {}）；事件按 `seq` 升序排序（`_sort_events`：带合法 int seq 的升序在前，缺 seq 的保持数组顺序排其后——已知问题 2 的确定性实现）；`ts` 不参与逻辑仅透传；字段访问全部 `dict.get` 宽松；`type` 不在 5 值白名单 → 跳过 + warning `unknown_event_type:<type>`；空事件列表 → 仍产合法空骨架 + warning `empty_events`。warning 词表全集：`empty_events` / `unknown_event_type:<type>` / `missing_url:<seq>` / `empty_value:<seq>` + 4 个 payload warning（`invalid_input_payload` / `invalid_events_payload` / `invalid_session_payload` / `invalid_event`，均为"宁出合法骨架不抛错"的宽松分支，test-report 已知问题 3）。掩码哨兵：`value == "<masked>"` 精确匹配为 spec 语义，实现用 `value.strip() == MASKED_SENTINEL` 超集判定（已知问题 4，防泄漏优先）。（出处：distiller spec §1.1；events.py:14-17/202-277；test-report §4.2/§4.3）
+### 卡 12 润色层：白名单 prompt + 四道闸整体回退
+- 面试官会怎么问：「润色层怎么保证不出错？LLM 会不会把产物改坏？」
+- **30-60 秒回答**：保证不在 prompt 而在回查层，prompt 只是第一道软约束。协议上，润色器是单异步方法：输入骨架文本和事件流、输出字符串；DefaultPolisher 走 litellm 的弱模型档（角色键 distiller_polish）——骨架是规则出的，弱模型就够了——温度钉 0.0，总尝试不超过 2 次，单次超时 60 秒；协议实现自身不做回退决策，任何异常向上抛给 api 层处理，职责分离。litellm 是函数内惰性 import，import 模块本身不触网络。prompt 白名单收得很窄——官方口径四条白名单：只许合并"连续且同一目标字段"的 input（保留最终值）、改措辞、改标题；硬约束：禁止增删 Then、禁止动任何引号字面值、禁止改顺序和关键词语义、恰好 1 Feature 1 Scenario、每行顶格、只输出 feature 本体。润色产物过四道闸、顺序由廉价到昂贵由格式到语义：一，清洗后非空；二，正则结构校验；三，事实回查；四，断言存活。任一道失败整体丢弃回退骨架，不做部分采用——部分采用要逐行可信度判定，复杂且引入新出错面，骨架永远在手上。五条失败路径全部收敛为"回退骨架 + fallback_reason"：polish_empty、syntax_invalid、fact_check_failed、assertion_dropped、polish_error；回退原因里的字面值列表最多列 5 个。发给模型的用户消息是骨架全文加一份紧凑事件摘要（每行序号、类型、name、值，值截 120 字符）。已知取舍一条：api 层捕获一切润色异常，包括"在已运行的事件循环里调同步入口"这种调用方式错误——也被静默降级为 polish_error 而不是暴露，评测走同步子进程不受影响。
+- 追问预案：「为什么不挑更强的模型做润色？」→ 骨架已经正确，润色只是可读性增强，弱模型档加硬闸足够，模型路由调优在 Out of Scope。「DefaultPolisher 有在线测试吗？」→ 没有，离线约束下用注入假润色器测全部逻辑，真模型只在离线双打（fake chat model）下有 3 条用例。
 
-**事实集（Facts，6 组 frozenset）**：模板生成**之前**从原始事件构建，与骨架文本无关——`urls`（每个非空 event.url + session.origin）、`values`（每个非空且 ≠`<masked>` 的 value）、`hints`（每个 target.name / target.form_label 非空者）、`assertions`（每个 assert_texts 非空元素）、`other`（target.ordinal / tag / role / id / page_title 非空字符串化，ordinal 数值入集如 `"2"`）、`caller_values`（test_data_values 的每个值——填充后的真实值属调用方提供的事实）。`literals()` 并集供回查。（出处：distiller spec §1.2；events.py:100-199）
+### 卡 13 密码掩码与占位符注入：三层各管一段
+- 面试官会怎么问：「密码怎么处理的？在哪一层掩码？占位符谁来填？」
+- **30-60 秒回答**：三层各管一段。录制层在采集那一刻就写死字面量 `"<masked>"`，绝不记录真实密码——但 name 和 label 照常采集，下游才知道这是"哪个字段的密码"。蒸馏层识别掩码值（用 strip 后比较的超集判定，宁多掩不可漏）换成 `{{TEST_DATA:password_序号}}` 占位符；占位符本身豁免事实回查，掩码值也不入事实集——它不是事实。如果调用方通过 test_data_values 提供真值，就填进步骤、且真值入事实集（调用方提供的事实），润色稿可以引用它；不提供就保留占位符、带显式 TODO。否决过两个方向：把掩码值当明文写进用例——绝不允许，泄漏敏感值是验收标准里机械检查的项；把掩码值整个排除出步骤——步骤就残缺了。编排层（CLI 的 generate 子命令）做两遍蒸馏：第一遍关掉润色出骨架，从骨架提取所需的占位符键集——键名由掩码事件的序号决定，只有骨架渲染出来才知道；第二遍只喂"需要的 ∩ 提供的"真值终蒸馏，防止多余键泄漏进产物。--test-data 收 JSON object，空串/布尔/null 视为未提供（与蒸馏器同一套规则，保证 CLI 的填充计数和产物永不矛盾），object/array 值是硬错误。缺键警告 missing_test_data 并保留占位符、提示人工填充后重跑；多键警告 unused_test_data。
+- 追问预案：「为什么不用另一个 LLM 推断密码文件？」→ 否决过"约定命名 test_data 文件靠 LLM 推断"的方案，不确定性太大，不做主路径。「引擎侧能不能自动注入？」→ 引擎侧没有任何占位符的机械消费者，这是合并分析发现的 P0-2，编排决策定为 CLI 填充，引擎侧自动注入明确 Out of Scope——完整故事见踩坑卡。
 
-**规则模板层（templates.py）**：
-- 命名：`Feature: Recorded flow on <origin>`（origin 缺失 → `Feature: Recorded flow`）；`Scenario: <第一个事件的 page_title>`（缺失 → `Recorded scenario`）；标题单行化 + 120 字符截断（`TITLE_MAX_LENGTH=120`）+ 文件名安全清洗（D22，`_FILENAME_UNSAFE_CHARS = [^\w\- ]+`，`\w` 含 CJK）；
-- 映射表（按 seq 顺序，每事件先输出自身步骤再输出其 assert_texts 的 Then；**首个** navigate 用 Given，其余全 When/Then）：
-  - navigate（首个）→ `Given I am on the page "{url}"`；navigate（后续）→ `When I navigate to "{url}"`；url 缺失 → `session.origin` → 再缺 → **整条事件（含其 assert_texts）跳过** + warning `missing_url:<seq>`（spec §2.2 只写"跳过该事件"，实现明确含 assert 一起跳过，phase1 P2-4 记录）；
-  - click → `When I click on the "{hint}" {role}`，hint 链 `target.name → form_label → id → tag → "element"`，role 链 `role → tag → "element"`（role 槽不加引号、不参与回查）；`ordinal` 存在且 >1 时尾部追加 ` (occurrence {ordinal})`（ordinal=1 不追加——录制器只在 >1 时写 ordinal，但手造数据可能 ordinal=1，蒸馏器防御一致）；
-  - input → `When I enter "{value}" in the "{hint}" field`，hint 链 `form_label → name → id → tag → "field"`；
-  - select → `When I select "{value}" from the "{hint}" dropdown`，hint 链 `form_label → name → id → "dropdown"`；
-  - submit → `When I submit the "{hint}" form`，hint 链 `name → form_label → "form"`（PLAN §3.2 表未覆盖 submit，此为补充定义）；
-  - submit（紧邻前驱为 click）→ **不生成自身步骤**（P0-1 去重，`_dedupes_preceding_click`：`index>0 && type=="submit" && 前驱 type=="click"`），但该 submit 的 assert_texts 的 Then **照常生成**，位置在该 click 步骤及其 Then 之后；前驱非 click 的 submit（如 Enter 键直接提交）不去重照常生成；
-  - 任意事件后 → `Then I should see "{text}"`，每个非空 text 一行；**跨 Scenario 去重**（同文本只在首次出现处生成，`seen_assertions` 集合，保持首次出现顺序）；
-- 值填充：掩码 → 占位符或真值（D17）；转义先 `\` 后 `"`（escape_literal）；换行/制表符折叠单空格、首尾 strip（fold_literal）；空值步骤仍生成（引号内空串）+ warning `empty_value:<seq>`（事实集空串不入集但 §5.2 豁免空串，自检不挂）；
-- 规则层不做任何合并/省略/改写（连续 input、重复 click 原样逐步输出），**唯一例外**是 click→submit 去重（D15）。
-（出处：distiller spec §2.2/§2.3/§2.4；templates.py 全文；test-report 补记；phase1 P2-4）
+### 卡 14 click+submit 去重放规则层，是规则层唯一例外合并
+- 面试官会怎么问：「点提交按钮为什么录两条事件？怎么不变成两步？」
+- **30-60 秒回答**：录制端忠实记录 click + submit 两条——它们都是真实 DOM 事件，录制层不做语义判断。去重放蒸馏器规则层：submit 且紧邻前驱是 click（按 seq 排序、过滤未知类型后的流判定）就丢弃 submit 自身步骤、保留 click 步骤——click 带按钮 name，重放定位更稳——但 submit 的断言照常生成、位置排在 click 及其断言之后；前驱不是 click 的 submit（比如回车键直接提交）不去重、照常生成。这是整个规则层唯一的例外合并，仍然是确定性规则、零模型依赖、可机械测试。为什么放规则层不放润色层？润色白名单只允许合并 input，而且 LLM 合并是非确定性、不可测的；也否决过"保留 submit 丢 click"——丢掉按钮 name 这个最好的定位线索。这条 originally 是个契约漏洞，两份 spec 互相指派导致无人落地，是合并分析里唯一的跨模块契约断点——完整故事见踩坑卡 P0-1。
+- 追问预案：「Enter 键提交怎么处理？」→ 前驱是 input 不是 click，不去重，submit 步骤照常生成。「这个去重是上线后打的补丁吗？」→ 是合并后分析（P0-1）发现并修的，修复守住了"不改 api/factcheck/polisher、公开 API 不变、不新增 warning"的边界。
 
-**事实回查算法（factcheck.py，精确语义）**：
-- 字面值定义：步骤行（strip 后以 Given/When/Then/And/But 开头，忽略大小写）中正则 `"((?:[^"\\]|\\.)*)"` 的捕获内容，提取时反转义（`\\`→`\`、`\"`→`"`；未知转义保留原文）；Feature/Scenario 标题行、注释行不是字面值来源；
-- 匹配：字面值 L grounded ⇔ 存在事实 F 使 `norm(L)==norm(F)` 或 `norm(L) ⊆ norm(F)`；`norm(s)` = 反转义后空白归一化（连续空白折叠单空格、strip），**大小写敏感**；空串字面值视为 grounded；
-- 豁免三条款：`{{TEST_DATA:*}}` 占位符（`^\{\{TEST_DATA:[^{}]*\}\}$`，匹配整个归一化字面值）；空串；模板静态兜底词 `element`/`field`/`dropdown`/`form`（lower 比对）；
-- 结构校验：逐行 strip 后——首个非空非注释行必须以 `Feature:` 开头；全文恰 1 个 `Feature:` 行、恰 1 个 `Scenario:` 行（忽略大小写）；其余每行必须以 7 个关键词之一开头（Feature:/Scenario:/Given /When /Then /And /But ）；忽略空行与 `#` 注释行；
-- 断言存活：骨架 Then 步骤的引号字面值，在润色稿中仍以引号字面值形式存在，方向为 润色 ⊆ 骨架（D21）；
-- `fallback_reason` 字面值列表最多 5 个（`MAX_REPORTED_LITERALS=5`）。
-（出处：distiller spec §5.1/§5.2/§5.3；factcheck.py 全文）
+### 卡 15 标题文件名安全清洗
+- 面试官会怎么问：「Feature 标题为什么会把文件写入搞挂？」
+- **30-60 秒回答**：Scenario/Feature 标题会被上游拆分器用作 JUnit 文件名，而上游只把空格换成下划线、没有任何文件名安全化——真实试点里标题是"Recorded flow on http://…"，URL 里的 :// 产生的 // 被当成了目录分隔符，写文件直接失败，阻塞了整条"真录→蒸馏→执行"链路。修复在蒸馏器源头做清洗：只保留字母数字、下划线、CJK、空格、连字符，其余连续段折叠成单个下划线，首尾下划线和空格剥掉，洗完为空回退默认标题；清洗只作用于标题行文本，不动 Feature 语义。否决过"在上游拆分前做安全化"：落在蒸馏器源头更稳，谁生产谁消毒，规范也固化进了蒸馏器设计文档。这是合并分析里的 P1-4，同步改了两条既有断言并新增一条回归用例——distiller 从 67 条到 68 条的那 +1 就是它。
+- 追问预案：「为什么不干脆去掉 URL 只留页面标题？」→ 标题取的是首个事件的 page_title，缺失才退到 origin；真实站点的 page_title 带 / 太常见，清洗比挑选更可靠。
 
-**公开 API（api.py）**：`distill_events(events, polisher=None, test_data_values=None) -> DistillResult`（内部 `asyncio.run` 驱动异步润色，对外同步）；`distill_file(events_path, output_path=None, polisher=None, test_data_values=None)`（默认输出同目录 `<stem>.feature`；输入 JSON 解析失败抛 DistillError——文件级错误不属于"输出永远合法"的范围，后者指生成逻辑对任意合法解析结果产出合法 feature）。`DistillResult` 字段：`feature_text`（最终输出）、`skeleton_text`（纯模板稿，永远存在，供测试/调试/回退）、`output_path`、`used_llm_polish`、`fallback_reason`、`warnings`。执行序：`parse_input` → `build_skeleton` → `validate_skeleton`（不过 → 抛 DistillError，D14/D26）→ polisher None 则直接返回骨架 → 否则 `_apply_polisher` 四道闸（D25）。（出处：distiller spec §3/§2.5；api.py 全文）
+### 卡 16 全离线、高覆盖的测试策略
+- 面试官会怎么问：「测试怎么做到全离线又高覆盖？」
+- **30-60 秒回答**：录制器侧，pytest + playwright，用 file:// 打开唯一一个 HTML fixture，page.evaluate 注入和生产完全同一份 JS 源码——与生产注入路径同构，不用起 HTTP 服务（录制器不依赖网络和 cookie，且验证过 file:// 下 history.pushState 可用，SPA 捕获成立、另有 hashchange 兜底）。conftest 提供会话级浏览器和函数级页面两级 fixture；schema 校验封装成一个复用入口，自动化和手动验收走同一个函数；每步操作后等 500 毫秒（300 毫秒快照窗口加 200 毫秒余量）让快照落地。蒸馏器侧全部走注入假润色器，真模型只在离线双打下有 3 条用例；生成物一律写 pytest 的 tmp_path，fixtures 目录不落生成物；4 份手写 Schema v1 样例 JSON 对抗稀疏字段和空会话。环境上有两个必须讲的坑：playwright 的 Python 包 pin 在 1.49 以下，要求的浏览器二进制版本和本机缓存不一致，首次跑报"可执行文件不存在"——开工先 install 一次，教训是 pin 住版本二进制也要对号入座；上游 config 在 import 时初始化 Sentry 并在进程退出时尝试外发事件，违背全程离线——测试 conftest 里用 setdefault 把遥测开关设为 0 关断。骨架三模块零模型依赖有负向 grep 机械检查背书；代码过 black（行长 200）加 isort，12 个文件检查全部不变更。
+- 追问预案：「测试速度？」→ recorder 20 例连续三次实测 9.97s / 9.82s / 9.88s（真浏览器）；distiller 68 例全离线 2-3 秒跑完。「手动验收怎么做的？」→ 书签栏点击无法自动化，用等价路径替代：同一份产物解码后 evaluate 注入，与点击书签完全同一条代码路径，人工书签栏点击留作演示前动作。
 
-**润色层（polisher.py）**：`Polisher` Protocol 单异步方法；`DefaultPolisher(get_model=...)` 经 `get_litellm_chat_model(role)` 取弱模型档（role key `distiller_polish`），钉温度 0.0（有 temperature 属性则设置），总尝试 ≤2（首次+1 重试），单次 `asyncio.wait_for` 超时 60s；单次空输出时 `last_error=None` 并继续重试，重试耗尽后无异常则返回空串（交给 api 层判 `polish_empty`）；任何异常 raise 给 api 层降级。prompt：SYSTEM_PROMPT 固化白名单 + 硬约束（含"每行顶格"双保险）；user 消息 = 骨架全文 + 紧凑事件清单（每行 `seq|type|target.name|value`，value 截 `DIGEST_VALUE_MAX_LENGTH=120`，缺省用 `-`，seq 缺省用数组序号+1）。`clean_polished_output` 复用 `testzeus_hercules.utils.gherkin_generator.clean_gherkin_output`（剥围栏/前导，不做缩进归一化）。所有测试走注入 FakePolisher；DefaultPolisher 无专属在线测试（离线约束），仅离线双打（fake chat model）下有 3 条用例。（出处：distiller spec §4；polisher.py 全文；test-report §2/§1）
+### 卡 17 Schema v1 契约：一处权威、两端对齐
+- 面试官会怎么问：「录制器和蒸馏器的契约怎么定的？怎么保证'录得出、蒸得对'？」
+- **30-60 秒回答**：契约是 PLAN.md 的 Schema v1：session 2 键 + 事件 8 键 + target 7 键；掩码约定加 Gherkin 引用 test_data；assert_texts 是断言 grounding；ordinal 专门应对"两个 Delete 按钮"这种同名场景。两份模块 spec 都声明 PLAN 契约为唯一权威、不增不改字段。合并后做过专项核查，把字段集、枚举、掩码哨兵、空 target 的回退加豁免、缺 dom_snapshot 的宽松处理、seq 缺失时的排序、四档值截断（500/200/120/8 条）逐一比对，确认除已知的 P0-1/P1-1/P1-2 外没有其它"录得出、蒸不对"的形态。两个字段全链路透传零消费：session 的 started_at 和 target 的 testid——testid 被记录为潜在的低成本可靠性增强点，要动 spec 所以先记录。蒸馏端是刻意宽松的解析：输入可以是完整对象也可以是裸事件数组；事件按 seq 升序排、缺 seq 的保持数组顺序排在其后（确定性）；类型不在五值白名单就跳过并记 warning；空事件列表仍产合法空骨架。warning 词表一共 8 个：4 个核心（空事件流、未知事件类型、缺 url、空值）加 4 个 payload 宽松分支——全部服务于"宁出合法骨架不抛错"。
+- 追问预案：「契约后来改过吗？」→ 修复都守着"公开 API 不变、不新增字段"的边界，变更以 spec 修订记录为准，没有静默漂移。「为什么 testid 不直接用于定位？」→ 引擎现场感知 DOM、按语义定位，不依赖 testid 这种结构属性；留作透传是为将来增强留的口子。
 
-**测试布局**：conftest 与 fixtures 下沉 `tests/record2gherkin/distiller/`（对 spec §0 的机械适配，录制器并行开发隔离）；生成物一律写 pytest `tmp_path`，fixtures 目录无生成物；fixtures 4 份手写 schema v1 样例：`login_search.json` / `form_submit.json` / `sparse_fields.json` / `empty_session.json`。conftest 的 `pytest_configure` 里 `os.environ.setdefault("ENABLE_TELEMETRY", "0")` 消除上游 config.py import 时初始化 Sentry 并在进程退出尝试外发事件的网络尝试（见 K12）。（出处：distiller test-report §1/§2）
+## 4. 踩坑故事卡
 
-### 3.3 跨模块契约与 CLI（P0-2 落地）
+### 故事 1（必背第一张）300ms 快照记串了门：Then 跑到状态变化前面
+- 什么时候讲：被问"讲一个你最有代表性的 bug"、"断言可靠性怎么保证"、"集成测试和单测的关系"时，主动掏出来。
+- **45-60 秒讲述**：现象：录制器到蒸馏器的集成冒烟里发现，蒸馏出来的用例里 Then 断言出现在状态变化之前——比如"填邮箱、点显示结果按钮"，结果文案"订单已提交成功"被记进了 input 事件的 assert_texts，生成"输入邮箱 → Then 应该看到订单已提交成功 → 最后才是点击"，重放时 Then 先于揭示文本的点击执行，必然假失败。定位：端到端跑真实流程才暴露；回看录制器时序——快照按"调度该快照的事件"归因，而 input 走定稿制、在下一次交互的 focusout 时才定稿入队，序号排在引发 DOM 变化的 click 前面，它那 300ms 的延迟快照在 click 揭示文本之后才拍摄，差集文本就被记到了先入队的 input 头上。根因：两个机制叠加——focusout 先入队是定稿制的副作用，延迟快照按调度事件归因；合起来就是"文本实际由后续事件造成，却记在先前事件头上"。修复：改成把差集文本归给触发时刻最新已入队的事件（追加写入、遵守 8 条上限）——归给更晚的事件总是安全的，因为文本在该事件之后持续可见；spec 同步修订，补了一条排除性回归用例：填邮箱、点击后，断言文本必须在 click 的 assert_texts 里、且不在 input 的。修复后全量 85 条通过（recorder 21 + distiller 64），集成冒烟 9/9。
+- 关键加分点（20 条单测为什么没拦住）：原用例只测了"点击后包含"、没测"点击前排除"；而且用例都是"单次点击 + 等待"的写法，操作间隔超过 300 毫秒，根本压缩不出时序。测试报告的已知问题里其实早预感了这个机制，还写着"这是 spec 机制的固有属性、不是实现缺陷"——集成冒烟证明它会造成重放假失败，性质就从"固有属性"升级为"必须修的缺陷"。
+- 收尾金句："单测证明每一块都对，时序缺陷只在拼起来时露头——'机制固有属性'不等于无害，要看下游付出什么代价。"
+- （下游量化推论：评测机器回放动作间隔必须 450 毫秒，不然多个动作压进最后一个事件、超出它 8 条 assert_texts 的上限——评测实测 F3 的"下单成功"就被挤掉过；真人手速天然满足这个节奏。）
 
-**Schema v1 契约（PLAN §3.1）**：session 2 键 + 事件 8 键 + target 7 键；掩码约定 `<masked>` + Gherkin 引用 test_data；assert_texts 为断言 grounding；ordinal 应对"两个 Delete 按钮"。两份模块 spec 均声明 PLAN §3.1 为唯一权威、不增改字段；phase1 专项核查确认"字段集（8 事件键/7 target 键）、枚举、掩码哨兵、空 target（回退到 element/field 且豁免回查）、缺 dom_snapshot（events.py 宽松处理）、seq 缺失排序、值截断（500/200/120/8 条）"逐一比对无其它"录得出、蒸不对"形态（除 P0-1/P1-1/P1-2）。`session.started_at` 与 `target.testid` 全链路不消费（透传；P2-6 记录 testid 是潜在的低成本可靠性增强点）。（出处：PLAN §3.1；recorder/distiller review 交叉核对表；phase1 专项核查 1/P2-6）
+### 故事 2 click+submit 双事件契约悬空：两份 spec 互相指派、无人落地
+- 什么时候讲：被问"录制和蒸馏的契约怎么定的"、"举一个跨模块协作出的问题"时。
+- **45-60 秒讲述**：现象：点 submit 按钮恒产出 click 和 submit 两条事件，蒸馏成"点击 Go 按钮"加"提交 User Go 表单"两步——重放时 click 已经触发提交跳转，submit 步骤落在新页面上、表单已经不存在，agent 必然失败或二次提交；而几乎所有真实流程（登录、搜索、下单）都含这个形态。定位：合并后专项分析定位了三处——录制器无条件记录、蒸馏器模板层没有合并规则、润色白名单只允许合并 input；还用临时页面（svg 图标按钮加 submit 表单）做了定向探针实证。根因：契约悬空——录制器 spec 写"两条事件由蒸馏器负责合并"，蒸馏器的润色白名单却只允许合并 input；两份 spec 互相指派、无人落地，这是全部契约里唯一的跨模块断点。修复：在蒸馏器规则层加确定性判定——submit 且紧邻前驱是 click 就丢弃 submit 自身步骤、保留 click 步骤（它带按钮 name，定位更稳），submit 的 Then 照常生成、位置在后；回车直接提交（前驱不是 click）不去重。守边界：不改 api/factcheck/polisher、公开 API 不变、不新增 warning。测试上新增 3 条去重用例，distiller 从 64 条到 67 条、全量从 85 到 88；最有意思的是一条既有的端到端用例断言"产物里包含 When I submit"，跟新规则直接矛盾，改成断言"不包含"——这条用例顺手变成了 P0-1 的端到端回归。
+- 收尾金句："两个'你负责'等于没有人负责——跨模块行为必须在一处 spec 里写死 owner，这是并行开发用血换的规矩。"
 
-**CLI `generate` 子命令（P0-2）**：见 D28。两遍蒸馏的动机：占位符键集 `password_<seq>` 只有骨架渲染后才知道（掩码事件的 seq 决定键名），第一遍无润色骨架是最廉价的键集来源；第二遍只喂 `needed ∩ provided` 防止 unused 键泄漏进 feature。`_read_test_data` 与蒸馏器 `_clean_test_data_values` 同规则（str/number 且 strip 非空才算提供；bool/null/空白视为未提供），保证 CLI 的 filled 计数与产物永不矛盾；顶层非 object 或含 object/array 值 → `_UsageError` 硬错。missing 时中文提示："以上键无值，feature 中保留 {{TEST_DATA:...}} 占位符（...），run 前需人工填充后重跑 generate"。收尾 log 一行：`output=/ needed=N filled=N used_llm_polish=... fallback_reason=...`。（出处：cli.py:303-404；STATUS.md D2" P0-2 占位符注入落 CLI generate"）
+### 故事 3 没人填的占位符：`{{TEST_DATA:password_6}}` 全仓找不到消费者
+- 什么时候讲：被问"密码怎么处理"、"占位符机制怎么落地"时。
+- **45-60 秒讲述**：现象：带密码的旗舰流程重放时，agent 只看到字面量 `{{TEST_DATA:password_6}}`，执行成败全看 LLM 猜。定位：合并分析做了全仓 grep——没有任何占位符替换逻辑；上游拆分工具只做拆分和单行化；test_data 加载器只把目录文件内容整块注入 prompt；而 password_6 这种键是合成出来的，和 test_data 目录的文件名没有确定性映射。根因：蒸馏器设计文档明确把"引擎侧 test_data 自动注入"划为 Out of Scope，但编排和评测侧也没人接——占位符成了没人填的仪式。修复：落到 CLI 的 generate 子命令，两遍蒸馏——第一遍关润色出骨架、提取需要的占位符键集（键名由掩码事件序号决定，只有骨架渲染出来才知道），第二遍只喂"需要的 ∩ 提供的"真值终蒸馏；缺键警告并保留占位符提示人工填充重跑，多键警告防止泄漏；空串/布尔/null 视为未提供、与蒸馏器同一套规则。掩码从 test_data 填充的 API 参数路径早在初版就有用例锚着。
+- 收尾金句："合成键在没有消费者时是纯仪式——新增占位符机制必须同步回答'谁在什么时候填'。"
 
-**录制节奏 ≥450ms 约束（评测侧机器回放）**：`record2gherkin/evaluation/record_flows.py:44` 定义 `STEP_WAIT_MS = 450`。由来：recorder 的新增文本快照有 300ms 延迟且归属"触发时刻最新事件"（D10），机器回放必须在动作间停顿——否则多个动作被压缩进最后一个事件，超出其 8 条 assert_texts 上限（评测实测 F3 的"下单成功"会被挤掉）；真人录制天然满足该节奏。这是 D4+D10 两个录制器决策在下游的量化推论：机器动作间隔 450ms = 300ms 快照窗口 + 落地余量。（出处：evaluation test-report 已知边界 6（:113）；record_flows.py:44/66）
+### 故事 4 兜底词炸自检：target 一缺失就抛错（附 submit 误名的孪生发现）
+- 什么时候讲：被问"事实回查的豁免是怎么回事"、"为什么 element/field 这些词要豁免"时。
+- **45-60 秒讲述**：现象（实现前被评审拦下）：事件 target 缺失或全空时，hint 兜底链末端写死的 element/field/dropdown/form 是引号字面值——既不在事实集也不在豁免清单，骨架自检就失败、抛 DistillError，直接违反"任何输入含缺失字段也必须产出合法 feature、绝不抛异常"的核心推论。定位：评审做契约核对——兜底链末端、豁免清单、事实集收录范围，三方一对就现形。根因：兜底词是模板常量、不是录制事实，却被当字面值参与了回查；骨架自检的本意是"校验器有 bug 才触发"，这条规则让它在合法输入上必然触发——自检从 bug 探测器退化成合法输入杀手。而且真实可达：schema 漂移、手写 fixtures 里 target 为 null 的 click 很自然。这里还有个孪生发现：submit 的 name 实测取到的是 form 内文本的首行（比如"User Go"）而不是 spec 预期的空串——form 有 innerText，按 name 规则会截 200 字符文本块；正常录制下 submit 事件仅因 tag=form 恰好进了事实集才侥幸通过自检。这个误名本身判为可容忍不修（无意义 hint，agent 扛得住，可选修法是录制器对 form 跳过 innerText）。修复：豁免清单加第三条款，四个兜底词按模板常量豁免；评审明确不推荐把它们加进事实集——那会污染 ground truth 的语义。改后不变量成立：模板全部引号字面值要么在事实集、要么在豁免集，"任意输入恒过"才对任意输入真的成立，并补了专属用例。
+- 收尾金句："豁免清单不是事后补丁，是'任意输入恒过'这条不变量的一半——新增模板常量必须同步过一遍回查不变量。"
 
-## 4. 踩坑全记录
+### 故事 5 缩进误杀：生产润色稿几乎全灭、离线测试却全绿
+- 什么时候讲：被问"你的硬闸会不会误杀"、"润色层真的能用吗"时。
+- **45-60 秒讲述**：现象（同样是实现前被评审拦下）：结构校验按行首锚定、没规定先 strip 行首空白，而 LLM 润色稿普遍给 Scenario 和步骤行加缩进——Scenario 计数变成 0 或关键词检查失败，判语法非法、整体回退。定位：评审去核读了下游复用的那个输出清洗函数——它只剥代码围栏和 Feature 前导，不做内部缩进归一化，救不了场。根因：校验端的锚定方式与被校验对象的实际形态不匹配。后果最阴险的地方：离线测试全绿——测试注入的假润色器是手写的、天然顶格；生产上真模型的输出却几乎每次被回退，润色层形同虚设，而且 35 条用例一条都不会暴露。修复：校验端所有行先 strip 行首行尾再做锚定和关键词检查（Feature/Scenario 计数同理）；双保险是 prompt 硬约束加"每行顶格"。补了"缩进文本结构合法"的专属用例。
+- 收尾金句："硬闸要先证明'对合法形态不误杀'，再谈'对非法形态拦得住'——措辞性误杀和'润色层永远可用'的架构保证直接矛盾。"
 
-### K1 快照归因缺陷（本模块最核心的坑，面试必讲）
-- **现象**：「录制器→蒸馏器」集成冒烟（`dev_runs/integration_smoke.py`，真录→蒸馏→上游 `split_feature_file` 可解析恰 1 场景）发现：蒸馏产物中 `Then` 断言出现在**状态变化之前**——例：fill 邮箱后点"显示结果"，结果文案"订单已提交成功"被写进 **input 事件**的 assert_texts，生成 `When I enter ...` → `Then I should see "订单已提交成功"` → 后面才是 click，重放时 Then 先于揭示文本的 click 执行，必然假失败。
-- **怎么定位**：集成冒烟端到端跑真实流程暴露；回看 recorder.js 时序——`scheduleSnapshot` 按"调度该快照的事件"归因，而 input 在下一次交互的 focusout 时才定稿入队（seq 先于引发 DOM 变化的 click），其 300ms 延迟快照在 click 揭示文本之后才拍摄，差集文本被归给先入队的 input。
-- **根因**：两个机制叠加：①focusout 先入队（input 定稿制副作用）+ ②延迟快照按调度事件归因。"文本实际由后续事件造成却记在先前事件头上"。
-- **修复**（提交 0ad2075，2026-09-21 01:33）：`scheduleSnapshot` 改为把差集文本归给**触发时刻最新已入队事件**（`events[events.length-1]`，追加写入、8 条上限）；归给更晚的事件总是安全的（文本在该事件之后持续可见）。spec §3 同步修订；新增回归用例 `test_assert_texts_attributed_to_latest_event`（fill → click → 断言文本在 click 的 assert_texts 里、不在 input 的）。修复后全量 85 passed（recorder 21 + distiller 64），集成冒烟 9/9 通过。
-- **20 条单测为何没拦住**：原用例只测了"点击后**包含**"（用例 14：点显示结果后 assert_texts 含结果文本），未测"点击前**排除**"；且用例均以"单次点击 + 等待"方式编写，操作间隔 > 300ms，压缩不了时序。test-report §6 已知问题 12 其实已预感该机制（"快照文本可能被归到前一个事件上……是 spec 机制的固有属性，不是实现缺陷"）——但集成冒烟证明它**会**造成重放假失败，性质从"固有属性"升级为"必须修的缺陷"。
-- **教训/遗留**：端到端冒烟与单测互补——单测验证各自 spec，跨模块时序缺陷只有真集成才暴露；"机制固有属性"不等于"无害"，要以下游可观察后果（重放假失败）定性。下游量化推论：评测机回放必须 `STEP_WAIT_MS=450` 停顿，否则多动作压进最后一个事件、超出 8 条上限（evaluation test-report 已知边界 6）。
-- **出处**：recorder test-report 补记 + §6.12；recorder spec §3 修订；recorder.js:278-304；0ad2075；phase1 专项核查 2；evaluation test-report:113。
+### 故事 6 标题里的 ：// 被当成目录分隔符（真实试点翻车）
+- 什么时候讲：被问"有没有真实环境翻过车"、"文件名/路径类问题"时。
+- **45-60 秒讲述**：现象：真实试点（pilot002）里，Feature 标题"Recorded flow on http://…"被上游拆分器用作 JUnit 文件名——上游只把空格换成下划线、没有文件名安全化——URL 里的 :// 产生的 // 被当成目录分隔符，写文件报错甚至有路径穿越风险，阻塞了"真录→蒸馏→Hercules 子进程"的拆分环节。定位：合并前阶段分析定为 P1-4；位置链从蒸馏器标题源头（首事件的 page_title 或 origin）一直到拆分器的文件名生成。根因：标题直通下游文件名，两端都没做安全化。修复：蒸馏器源头清洗——只保留字母数字、下划线、CJK、空格、连字符，其余连续段折叠成单个下划线，首尾剥掉，洗完为空回退默认标题；只作用于标题行文本。同步改了两条既有断言（期望值变成下划线版 URL，比如 https_staging_example_com 这种形态）并新增一条文件名安全回归——distiller 67 到 68 的那 +1 就是它。
+- 收尾金句："凡是会被下游当文件名的字符串，出生时就要洗干净——不赌下游行为，真实站点的页面标题带 / 太常见了。"
 
-### K2 P0-1：click+submit 双事件契约悬空，真实站点重放必坏
-- **现象**：点 submit 按钮恒产出 `click(seq N)` + `submit(seq N+1)` 两条事件，蒸馏为 `When I click on the "Go" button` + `When I submit the "User Go" form` 两步（探针实测）。重放时 click 已触发提交/跳转，submit 步骤落在新页面上（表单已不存在）→ agent 必然失败或二次提交。几乎所有真实流程（登录/搜索/下单）都含此形态。
-- **怎么定位**：phase1-merge-analysis 定位三处：recorder.js handleSubmit 无条件记录 + distiller templates 无合并规则 + polisher SYSTEM_PROMPT 白名单只允许合并 input；另用临时页面（svg 图标按钮 + submit 表单）定向探针实证。
-- **根因**：**契约悬空**——recorder spec §4.2 写"两条事件由蒸馏器负责合并"，distiller 润色白名单却只允许合并 input；两份 spec 互相指派、无人落地，是唯一跨模块契约断点。
-- **修复**（提交 fe11083，2026-09-21 01:59）：蒸馏器 templates 层新增确定性判定 `_dedupes_preceding_click`：submit 且紧邻前驱（按 seq 排序、过滤未知类型后的流）为 click → 丢弃本 submit **步骤**、保留 click 步骤（带按钮 name hint 定位更稳）、保留该 submit 的 Then（位置在 click 及其 Then 之后）；前驱非 click 的 submit（Enter 键直接提交）不去重。守边界：不改 api/factcheck/polisher、公开 API 不变、不新增 warning。spec 同步：distiller spec §2.2 新增行；recorder spec §4.2/§4.5 注明。
-- **测试**：新增 3 条（`test_click_then_submit_dedupes_submit_step` / `test_deduped_submit_keeps_its_assertions_after_click` / `test_standalone_submit_keeps_its_step`），distiller 64→67、全量 85→88；既有断言 `test_end_to_end_form_flow` 的 `'When I submit the "form" form' in feature` 与新规则直接矛盾，改判 `assert "When I submit" not in feature`（该用例因此同时成为 P0-1 端到端回归）。
-- **教训/遗留**：跨模块行为必须在**一处** spec 里写死owner，"你负责"式互相指派在并行开发时必然漏落地；规则层去重是零模型依赖红线内的正确落点。
-- **出处**：phase1 P0-1；distiller test-report 补记；distiller spec §2.2；fe11083。
+### 故事 7 一个字段三处定义打架：dom_snapshot 是 null 还是对象
+- 什么时候讲：被问"spec 质量怎么保证"、"契约文档踩过什么坑"时。
+- **45-60 秒讲述**：现象（实现前被评审拦下）：初始 navigate 的 dom_snapshot 字段，spec 三处定义互相矛盾——示例 JSON 里写 null、另一节说"快照为 null"、字段表又说"恒存在、采集失败时是空数组对象"。null 派和对象派是两代设计没收敛的残留。根因：spec 迭代时旧设计没删干净，直接违背 spec 自己立的标准——"实现者读完不再需要做设计决策"；而且用例的断言值形态取决于这个未决项，实现者没法同时满足。修复：统一为"字段恒存在、恒为对象；初始 navigate 就是空数组对象"，同步改掉两处旧表述。下游蒸馏器是宽松解析、新旧两种都能消化、不破契约——但录制器 spec 必须唯一确定。
+- 收尾金句："'消费方能兜底'不豁免上游契约的唯一性——spec 的读者是实现者，不是猜谜者；同一字段的全局定义要搜一遍再定稿。"
 
-### K3 P0-2：`{{TEST_DATA:password_<seq>}}` 无机械消费者
-- **现象**：带密码流程（旗舰场景）重放时，agent 只看到字面量 `{{TEST_DATA:password_6}}`，执行成败取决于 LLM 猜测。
-- **怎么定位**：phase1 全仓 grep——无占位符替换逻辑；`gherkin_helper.py` 只做拆分/单行化；`static_data_loader.py:70-125` 只把 TEST_DATA_PATH 目录文件内容整块注入 LTM prompt；`password_<seq>` 是合成键，与 test_data 目录文件名无确定性映射。
-- **根因**：蒸馏器只负责"产出占位符 + 生成期可选值替换"（distiller spec §8 明确引擎侧 test_data 自动注入 Out of Scope），但编排/评测侧没人接。
-- **修复**：落 CLI `generate` 两遍蒸馏 + `--test-data`（D28/K3 前节详述）；STATUS.md D2 记"P0-2 占位符注入落 CLI generate"。测试锚点：`test_masked_input_filled_from_test_data` 早在初版就验证了 API 参数路径。
-- **教训/遗留**：合成键（`password_<seq>`）在无消费者时是纯仪式；新增占位符机制必须同步指定"谁在什么时候填"。
-- **出处**：phase1 P0-2；cli.py:303-404；STATUS.md:30；distiller spec §2.3/§8。
+### 故事 8 spec 自己打架的两件小事：示例违规 + 点空白矛盾
+- 什么时候讲：被问"spec 和实现不一致怎么处理"、"文档债务"时，两个一起讲。
+- **45-60 秒讲述**：第一件：回查规则的示例自相矛盾——spec 里有个示例说字面值"order placed"是事实"Your order has been placed successfully"的子串、应该通过，但按规范的连续子串算法它根本不是连续子串；示例是按"词序子集"的直觉写的，跟规则文字冲突。处置：按规范实现严格连续子串，示例用例改成两种情形都断言——连续片段"order has been placed"通过、非连续词组"order placed"不通过；留了个口子：评测期若发现真实润色稿因此被误杀，再评审放宽成词序子集（会削弱硬闸）。第二件：点空白判定两节打架——字面规则是"target 是 document/html/body 且 name 为空才丢"，但 body 的 innerText 是整页文本，字面实现会把整页文本写成 name，和去噪总表"点空白记 0 条"直接矛盾。处置：实现取严，body/html 一律丢弃，代码注释写明理由、测试报告记为已知问题。这类"有意为之的 spec 文字漂移"一共五项、全部双处留痕：点空白取严、navigate 去重不限"同 tick"、掩码判定用 strip 后超集比较（宁多掩不可漏）、骨架自检挪到 api 层防循环依赖、示例不自洽这条。
+- 收尾金句："spec 里的示例本身就是规范——没人只读规则文字不读示例；两条规则冲突时，取最简且确定的一侧并留痕。"
 
-### K4 兜底词未 grounding：缺 target 输入必触发 DistillError（distiller review 必改 1）
-- **现象**（spec 层，实现前被 review 拦下）：事件 target 缺失/全空时，hint 兜底链末端写死的 `"element"/"field"/"dropdown"/"form"` 是引号字面值——不在事实集也不在豁免清单 → 骨架自检失败 → **抛 DistillError**，直接违反核心目标推论 2（任何输入含缺失字段必须产出合法 feature 绝不抛异常）。
-- **怎么定位**：distiller review 契约核对——§2.2 各 fallback 链末端 vs §5.2 豁免清单只有占位符与空串 vs §1.2 事实集只收录制事实。
-- **根因**：兜底词是**模板常量不是录制事实**，却被当字面值参与回查；§2.5 自检本意是"校验器 bug 才触发"，该规则使它在合法输入上必然触发，自检不再是纯 bug 探测器。真实可达路径：schema 漂移、手写 fixtures（`"target": null` 的 click 很自然）、submit 事件 target=null（录制器 submit name 通常空串，仅因 tag="form" 恰好入事实集才在正常录制下侥幸通过）。
-- **修复**：§5.2 豁免清单增加第三条款（D18）；review 明确不推荐把四词加进事实集（污染 ground truth）。改后不变量成立：模板全部引号字面值 = 事实集成员或豁免项，"任意输入恒过"对任意输入成立。落地后另有专属用例 `test_template_fallback_words_are_exempt`。
-- **教训/遗留**：新增模板常量时必须同步过一遍回查不变量（"字面值 ⊆ 事实集 ∪ 豁免集"）；豁免清单是"任意输入恒过"不变量的组成部分，不是事后补丁。
-- **出处**：distiller review 必改 1；distiller spec §5.2；factcheck.py:26-27/79-86。
+### 故事 9 环境与验收三小坑：浏览器二进制、Sentry 外发、11 字符前缀
+- 什么时候讲：被问"搭测试环境踩过什么坑"、"验收标准怎么落地"时。
+- **45-60 秒讲述**：三个小坑各一段。坑一：playwright 的 Python 包环境里已有、但 pin 在 1.49 以下，它要求特定版本的 chromium headless shell 二进制，本机缓存里是别的版本装进去的——首次跑直接报"可执行文件不存在"。处置：开工先 install 一次（一次性、需网络）；教训是 pin 住 playwright 版本，浏览器二进制也要对号入座——计划文档里"环境已有 playwright"只对 Python 包成立。顺带冒烟验证了 file:// 下 history.pushState 可用（SPA 捕获的前提，另有 hashchange 兜底）。坑二：pytest 结束时冒出"Sentry 正在尝试发送 2 条待发事件"——上游 config 在 import 时初始化 Sentry 并在进程退出时外发，违背全程离线的验收。修复：测试 conftest 的 pytest_configure 里用 setdefault 把遥测开关设为 0（显式设 1 时仍以环境为准），外发尝试消失；教训是 import 副作用（遥测、配置单例）要在测试入口最早处关断。坑三：验收口径两处小偏差——spec 写 bookmarklet"首 10 字符是 javascript:"，实际这个前缀是 11 个字符，断言改成 startswith 加完整前缀长度校验并明注差异；另一条要求"手动点真实书签栏走通流程"，无头环境点不了书签栏，改为等价自动化：同一份产物解码后用 evaluate 注入（与点击书签完全同一条代码路径）加同一个 schema 校验函数，人工书签栏点击留作演示前动作。
+- 收尾金句："环境坑的共同教训：假设要有验证、副作用的开关要握在自己手里、验收标准要么可机械执行要么显式声明等价路径。"
 
-### K5 缩进误杀：LLM 润色稿被系统性判非法（distiller review 必改 2）
-- **现象**（spec 层，实现前被 review 拦下）：§5.1 结构校验按 `^` 行首锚定、未规定先 strip 行首空白。LLM 润色稿普遍给 Scenario/步骤行加缩进 → Scenario 计数为 0 或关键词检查失败 → 判 `syntax_invalid` → 整体回退。
-- **怎么定位**：review 核读 `clean_gherkin_output`（utils/gherkin_generator.py:11-22）——只剥围栏和 Feature: 前导，**不做内部缩进归一化**，救不了场。
-- **根因**：校验端锚定方式与被校验对象的实际形态（LLM 缩进产出）不匹配。后果最阴险：离线测试全绿（FakePolisher 手写、天然顶格），生产 DefaultPolisher 却几乎每次被回退——润色层形同虚设，且不会被 35 条用例暴露。
-- **修复**：§5.1 加"所有行先 strip 行首（及行尾）空白后再做锚定与关键词检查（Feature:/Scenario: 计数同理）"；双保险：SYSTEM_PROMPT 硬约束加"每行顶格（column 0）"。落地后有专属用例 `test_indented_text_is_structurally_valid`。
-- **教训/遗留**：校验器的措辞性误杀与"润色层永远可用"的架构保证直接矛盾——硬闸要先证明"对合法形态不误杀"，再谈"对非法形态拦得住"。
-- **出处**：distiller review 必改 2；distiller spec §5.1；polisher.py:33；factcheck.py:106-128。
+### 故事 10 范围外已知缺陷两连：svg 图标按钮与 checkbox 双事件
+- 什么时候讲：被问"这工具现在还有什么已知问题"时——主动说边界是加分项。
+- **45-60 秒讲述**：两个已记录、明确排到下一阶段的问题。第一，无语义点击产出垃圾步骤：spec 本来写"目标向上取最近的有语义祖先"，实现没落地——aria-label 是"Close dialog"的纯图标按钮，点击落在 svg 上，录成 tag=svg、name 为空，蒸馏出 `When I click on the "svg" generic`——aria-label 全丢，而且回查不拦，因为"svg"本身在事实集里。建议修法是录制器加具名祖先探测、或蒸馏器记 warning，未在本模块修。第二，checkbox/radio 双事件执行歧义：物理点击产出 click 加 input("true") 两条，蒸馏出"点击 checkbox"和"往字段输入 true"两步并存——重放时 click 已经切换了状态，fill 对 checkbox 的语义未定义（Playwright 会直接报错）；勾了又取消还会膨胀成 4 步。建议蒸馏规则丢弃这类步骤或改写成 check/uncheck 措辞，也未在本模块修。
+- 收尾金句："忠实记录是原则，忠实到垃圾步骤就是语义层欠的债——两条都记了账、修法明确，排在核心目标之后，不装没看见。"
 
-### K6 标题的 `://` 当目录分隔符（P1-4，pilot002 复盘）
-- **现象**：真实 pilot（pilot002）中，`Feature: Recorded flow on http://...` 的标题被上游 `split_feature_file` 用作 JUnit 文件名（`gherkin_helper.py:70-71` 只 `scenario_title.replace(' ', '_') + ".feature"`，无文件名安全化），`://` 产生的 `//` 被当作目录分隔符 → 写文件 ENOENT/路径穿越，阻塞"真录→蒸馏→Hercules 子进程"拆分环节。
-- **怎么定位**：阶段 1 分析定为 P1-4；位置链 templates.py 标题源头（首事件 page_title / origin）→ gherkin_helper 文件名。
-- **根因**：蒸馏器标题直通下游文件名，两端都没做安全化。
-- **修复**（提交 7ce6c95，2026-09-21 03:05）：蒸馏器源头清洗（D22）：`[^\w\- ]+` → `_`、连续 `_` 折叠、strip `"_ "`、空则回退默认标题；保留 Feature 标题行语义（清洗只作用于标题行文本）。同步改 2 条既有断言（`test_end_to_end_sample_flow`、`test_hercules_helper_integration` 期望 `Recorded flow on https_staging_example_com`）+ 新增回归 `test_title_sanitized_to_filename_safe`（distiller 67→68 的 +1）。
-- **教训/遗留**：任何会被下游当文件名/路径的字符串，生产点就应文件名安全化，不赌下游行为；page_title 含 `/` 在真实站点常见。
-- **出处**：distiller spec §2.1；phase1 P1-4；7ce6c95 diff；templates.py:52-59。
+### 故事 11 "同源"声明不严格：录制 name 和引擎可访问名其实是两套
+- 什么时候讲：被问"你录的名字和执行引擎看到的元素真是一回事吗"——考诚实度的问题。
+- **45-60 秒讲述**：文档里说过录制器的 name 属性集合与引擎的可访问名函数"同源"，实测这个说法要打折扣，三档口径并录。第一，契约口径是五级优先级（aria-label、关联 label、placeholder、innerText、title），它是唯一权威，录制器和蒸馏器都遵契约、顺序差异是契约层的既定决策、不算录制器漂移。第二，引擎实际的手动链是 aria-label → aria-labelledby → alt → title → placeholder → input value → innerText——顺序不同，还多 alt 和 value 两级。第三，更关键的：引擎手动链不含任何 label 关联——checkbox 会落到元素默认值"on"；引擎的可访问节点计算返回 Promise 没 await、实际恒走手工回退。后果：`When I click on the "邮箱地址" field` 这种步骤在引擎语义树上可能对不上同名节点，全靠 LLM 模糊匹配救。处置：不预先改——评测期加"name 命中率"统计，用数据决定补哪边（补录制器关联探测还是补引擎的 label 链）。
+- 收尾金句："'同源'不是声明出来的，是对拍出来的——跨模块的属性口径要拿实现逐级对，不能文档互抄。"
 
-### K7 初始 navigate 的 dom_snapshot 三处定义互相矛盾（recorder review 必改 1）
-- **现象**（spec 层，实现前被 review 拦下）：§2 示例 JSON 写 `"dom_snapshot": null`、§4.6.1 写"snapshot 为 null"、§2 字段表写"恒存在，采集失败 `{"assert_texts": []}`"、§3 写"首个 navigate 的 assert_texts 为空数组"——null 派与对象派是两代设计残留未收敛。
-- **根因**：spec 迭代时旧设计（无基线）没删干净；直接违背 spec 头部"实现者读完不再需要做设计决策"，且用例 1/17 的断言值形态取决于这个未决决策。
-- **修复**：统一为"字段恒存在、恒为对象；初始 navigate = `{"assert_texts": []}`"；同步改 §2 示例与 §4.6.1 两处；下游蒸馏器宽松解析两种都能消化（不破契约），但录制器 spec 必须唯一确定。
-- **教训/遗留**：同一 spec 内同一字段的定义要全局 grep 一遍再定稿；"宽松消费方"不豁免上游契约的唯一性。
-- **出处**：recorder review 必改 1；recorder spec §2/§3/§4.6.1。
+## 5. 必背数字
 
-### K8 spec 用例 20 示例与 §5.2 规则不自洽（`order placed` 非连续子串）
-- **现象**：distiller spec §6 用例 20 示例称字面值 `order placed` ⊆ 事实 `Your order has been placed successfully` 应通过，但按 §5.2 规范算法（连续子串）它**不是**连续子串，应判不 grounded。
-- **怎么定位**：实现期对照 §5.2 精确语义发现。
-- **根因**：spec 示例按"词序子集"直觉书写，与规范算法（严格连续子串）不一致。
-- **修复/取舍**：按 §5.2 规范实现（严格子串），用例内改判为两种情形都断言——连续片段（`order has been placed`）通过、非连续词组（`order placed`）不通过；若评测期发现真实润色稿因此被误杀，再考虑放宽为词序子集匹配（会削弱硬闸，需评审）。
-- **教训/遗留**：spec 里的示例本身就是规范——示例与规则文字冲突时实现者必须二选一，写 spec 时应对每个示例跑一遍规则。
-- **出处**：distiller test-report 已知问题 1；distiller spec §5.2/§6 用例 20；phase1 P2-3。
-
-### K9 点空白判定：spec §4.2 字面与 §4.7 去噪总表矛盾
-- **现象/根因**：§4.2 字面是"target 为 document/html/body **且 name 为空**才丢弃"，但 body/html 的 innerText 是整页文本，字面实现会把整页文本写成 name，与 §4.7"点空白 → 0 条"矛盾。
-- **修复/取舍**：实现取严——documentElement/body 一律丢弃（recorder.js:351-355 注释明示理由），记为已知问题 1；phase1 P2-3 列为"有意为之的 spec 文字漂移（双方记录在案，无动作）"。
-- **教训/遗留**：当 spec 两条规则冲突时，取"最简且确定"的一侧并在代码注释与 test-report 双处留痕。
-- **出处**：recorder test-report §6.1；recorder.js:351-355；phase1 P2-3。
-
-### K10 submit 的 target.name 取到 form innerText 首行
-- **现象**：探针实测 submit 事件 name = `"User Go"`（form innerText 首行）而非 spec §4.5 预期的"通常取不到为空串"——`<form>` 有 innerText（整块表单文本），按 §2.1.2 会取到截 200 字符的文本块。
-- **根因**：recorder spec §4.5 预测不准（recorder review 建议 3b 已指出）。
-- **处置**：不修（P2-1，"无意义 hint，agent 可容忍"；可在 recorder 对 tag=form 跳过 innerText，记录即可）；但它正是 K4 中"submit 仅因 tag=form 恰好入事实集才侥幸通过"的另一半。
-- **教训/遗留**：对"某属性通常取不到"的预测要拿真实 DOM 验证。
-- **出处**：recorder review 建议 3b；phase1 P2-1；recorder spec §4.5。
-
-### K11 测试环境前置：playwright 浏览器二进制缺失
-- **现象**：recorder review 实测当前 `.venv` 的 playwright（pin ≤1.49）要求 `chromium_headless_shell-1148`，本机缓存只有 `chromium-1243`（其他 playwright 版本装入），首次跑报 `Executable doesn't exist`。
-- **处置**：D1 开工前 `uv run playwright install chromium`（一次性，需网络）；plan"uv 环境已有 playwright"仅对 Python 包成立。同时 D1 冒烟先验证 file:// 下 `history.pushState`（Chromium 对 file:// 同文档 pushState 既有行为可用，且 spec 同时监听 hashchange 兜底）。
-- **教训/遗留**：pin 住 playwright 版本意味着浏览器二进制也要对号入座。
-- **出处**：recorder review 建议 1；recorder plan §2/§5。
-
-### K12 上游 Sentry 遥测污染离线测试
-- **现象**：pytest 结束输出出现 `Sentry is attempting to send 2 pending events`——上游 `testzeus_hercules/config.py` 在 import 时初始化 Sentry 客户端并在进程退出时尝试外发事件，违背"全程离线"验收。
-- **修复**：`tests/record2gherkin/distiller/conftest.py` 的 `pytest_configure` 里 `os.environ.setdefault("ENABLE_TELEMETRY", "0")`（用 setdefault，显式设 1 时仍以环境为准）；外发尝试消失。
-- **教训/遗留**：import 副作用（遥测/配置单例）要在测试入口最早处关断。
-- **出处**：distiller test-report §2。
-
-### K13 验收口径小偏差："首 10 字符" vs 实际 11 字符前缀；MVP 验收的等价自动化
-- **现象**：recorder spec §8.2 写"首 10 字符为 `javascript:`"，实际 `javascript:` 是 11 字符；spec §8.3 要求手动用 bookmarklet 走通 MVP 流程，无头环境无法点击真实书签栏。
-- **处置**：用例 20 断言 `startswith("javascript:")` 且长度校验用完整前缀（test-report 明注差异）；§8.3 以等价自动化验证——同一份产物 `unquote` 后 `page.evaluate`（与点击书签完全同一条代码路径）+ 同一 `validate_event_stream` 校验，人工书签栏点击建议演示前做一次。
-- **教训/遗留**：验收标准的字面细节（字符数、手动步骤）要可机械执行，或显式声明等价路径。
-- **出处**：recorder test-report §4.2/§4.3。
-
-### K14 P1-1：无语义 click（图标按钮）产出垃圾步骤——实现-spec 漂移影响最大的一条（范围外相邻，简要附注）
-- recorder spec §4.2 本写"目标向上取最近的有语义祖先"，实现未落地：`aria-label="Close dialog"` 的纯图标按钮点击，event.target 落在 svg 上，录制为 `tag=svg name=''`，蒸馏产物 `When I click on the "svg" generic`——aria-label 全丢且回查不拦（"svg" 在事实集内）。phase1 列为建议下一阶段项（recorder 加具名祖先探测或 distiller 记 warning），未在本模块修复。**出处：phase1 P1-1。**
-### K15 P1-2：checkbox/radio 双事件执行歧义（范围外相邻，简要附注）
-- 物理点击 checkbox 产 click + change→input("true") 两条，蒸馏出 `When I click on the "★ 订阅邮件" checkbox` + `When I enter "true" in ... field` 并存——重放时 click 已切换状态，fill 对 checkbox 执行语义未定义（Playwright fill 会报错）；勾又取消会膨胀成 4 步。建议蒸馏规则丢弃/改 check/uncheck 措辞，未在本模块修复。**出处：phase1 P1-2。**
-### K16 P1-3：录制 name 与引擎可访问名"同源"声明不成立（范围外相邻，简要附注）
-- 三档口径并录：①recorder plan/spec 称属性集合与 `getAccessibleName`（get_detailed_accessibility_tree.py:1050-1087）同源；②recorder review 备注 a 实测引擎手动链为 aria-label → aria-labelledby → **alt → title → placeholder** → input value → innerText，与契约顺序不同且多 alt/value 两级（契约是唯一权威，不算录制器漂移）；③phase1 P1-3 进一步指出引擎手动链**不含任何 label 关联**（checkbox 落到 element.value="on"；`getComputedAccessibleNode` 返回 Promise 未 await 实际恒走手工回退）——`When I click on the "邮箱地址" field` 在引擎树上可能对不上同名节点，全靠 LLM 模糊匹配。评测期建议加"name 命中率"统计，不预先改。**出处：recorder review 备注 a；phase1 P1-3。**
-
-### 其余已记录的刻意取舍（P2 档，一览）
-- P2-3 五项"有意为之的 spec 文字漂移"：点空白取严（K9）；navigate 去重不限"同 tick"（实现按 `lastNavigateUrl === location.href` 判定）；掩码判定 `strip()==` 超集（宁多掩不漏）；骨架自检移 api 层（D26）；用例 20 示例不自洽（K8）。
-- P2-2：`"<file>"` 哨兵按普通值进步骤（`When I enter "<file>" ...`），不可执行，评测数据出现该步骤判 N/A；distiller review 建议 1 曾提"应写死处置"，实现按普通值透传（蒸馏器 review 判定输出合法不阻塞）。
-- P2-4：navigate 缺 url 被跳过时其 assert_texts 一并丢弃（实现比 spec 字面更严）；recorder 恒有 location.href 实际不可触发，仅手造数据命中。
-- P2-5：`_apply_polisher` 捕获一切异常，包括已运行事件循环内调 `asyncio.run` 的 RuntimeError——被静默降级为 polish_error 而非暴露调用方式错误；评测走同步子进程不受影响。
-- P2-6：target.testid 全链路采集但零消费（重放最稳定位线索，评测期低成本增强点，需动 spec，先记录）。
-（出处：phase1 P2-1..P2-6；distiller review 建议 1）
-
-## 5. 面试深挖要点
-
-| 预期追问 | 一句话答 | 详见 |
+| 数字 | 白话含义 | 什么时候会被问 |
 |---|---|---|
-| 为什么用注入式 JS，不用浏览器扩展或 Playwright 录制？ | 扩展需要 manifest/加载/商店审核，注入式零安装、复制一条书签即可演示，且跨文档导航等形态边界如实写进已知限制；Playwright tracing 备选源文档未记录（未核实），可说的是评测框架用 Playwright 只是**回放动作驱动录制器**、codegen 只作存活率对照基线 | §2 D1/D1a；§3.1 navigate 与 MPA 边界 |
-| bookmarklet 怎么打包的？为什么不做 minify？ | python 纯标准库读源码 → IIFE 包裹（源码已是 IIFE 则原样）→ `urllib.parse.quote(safe="")` 全量 URL 编码 → 拼 `javascript:` 前缀，产物与源码 `unquote` 后逐字节一致；minify 有改坏语义风险不值当，Chrome bookmarklet 上限 >100KB 无需压缩，且本机无 Node 引入工具链违背小而准 | §2 D7 |
-| 密码是怎么处理的？在哪一层掩码？ | 录制层在**采集时**就写死字面量 `<masked>`（绝不记录真实值，name/label 照常采集），蒸馏层精确识别后换成 `{{TEST_DATA:password_<seq>}}` 占位符、`test_data_values` 可填真值且真值入事实集、CLI `--test-data` 填充并对 missing 键告警保留占位符；实现用 `strip()` 超集判定是宁多掩不漏 | §2 D17/D28；§3.2/§3.3 |
-| assert_texts 为什么是差集？300ms 怎么定的？ | 延迟 300ms 让点击引发的 DOM 更新先落地；与上次快照做差集保证记录的是"这次操作**新出现**的文本"——加载即存在的文本（start 基线）不构成断言依据；上限 8 条/条 120 字符兜体积，轮播图/计时器噪声 MVP 接受、由蒸馏器事实回查兜底 | §2 D4；§3.1 dom_snapshot |
-| 讲一个你最有代表性的 bug | 快照归因缺陷：input 在下一次交互的 focusout 才定稿入队（先于引发 DOM 变化的 click），300ms 快照在 click 揭示文本之后拍摄，按调度事件归因就把新文本记给了 input——蒸馏出 Then 早于状态变化、重放必假失败；20 条单测只测"点击后包含"没测"点击前排除"所以没拦住，集成冒烟暴露后改为归给触发时刻最新已入队事件，补排除性回归用例 | §4 K1 |
-| 点提交按钮为什么录两条事件？怎么不变成两步？ | 忠实记录（click+submit 都是真实 DOM 事件），去重放蒸馏器规则层：submit 紧邻前驱是 click 就丢弃 submit 步骤保 click 步骤（带按钮 name hint 定位更稳）、submit 的 Then 保留且位置在后；Enter 键直接提交（前驱非 click）不去重照常生成——这是规则层唯一例外合并，零模型依赖可机械测试 | §2 D15；§4 K2 |
-| 为什么骨架自检失败要抛错而不是回退？ | 模板由事实集生成、按构造应恒过，自检失败只可能是校验器/模板的 bug，静默兜底会掩盖 bug——这是全链路唯一主动抛错路径（DistillError），且测试必须覆盖"任意输入恒过"不变量；为了让 templates 保持纯函数，检查动作放 api 层避免循环依赖 | §2 D14/D26 |
-| 润色层怎么保证不出错？ | 保证不在 prompt 而在回查层：四道闸（输出清洗非空 → 正则结构校验 → 事实回查 → 断言存活）任一失败**整体**回退骨架并记 fallback_reason（polish_error/syntax_invalid/fact_check_failed/assertion_dropped/polish_empty 五条路径），不做部分采用——骨架永远在手上 | §2 D25/D16 |
-| 事实回查的匹配规则精确是什么？为什么允许子串、方向朝哪边？ | 字面值 L grounded ⇔ `norm(L)==norm(F)` 或 `norm(L) ⊆ norm(F)`（norm=空白归一化，大小写敏感）；允许 L⊆F 是容忍润色截取（长断言取短语）；断言存活检查方向固定"润色 ⊆ 骨架"（只许缩短不许加长，双向会放行加长断言削弱硬闸）；豁免三条款：占位符、空串、模板兜底词 element/field/dropdown/form | §2 D20/D21/D18 |
-| 为什么 element/field 这些词要豁免？不豁免会怎样？ | 它们是模板 fallback 链末端的写死常量、不是录制事实；不豁免的话 target 缺失的合法输入必然自检失败抛 DistillError——违反"任何输入恒产合法 feature"的核心推论，自检也从 bug 探测器退化成合法输入杀手 | §4 K4 |
-| 润色稿被误杀的风险有哪些，怎么防的？ | 两个系统性误杀点都被 review 拦下：缩进（LLM 普遍缩进而 clean_gherkin_output 不归一化 → 校验端每行先 strip + prompt 要求顶格双保险）；严格子串对非连续词组的误杀（保留严格子串，评测期有误杀再评审放宽） | §4 K5/K8 |
-| `{{TEST_DATA}}` 占位符谁来填？ | 生成期 CLI `generate` 两遍蒸馏：先无润色骨架提取所需键集，`--test-data` JSON 提供真值（blank/bool/null 视为未提供、与蒸馏器同规则），只喂 needed∩provided 防泄漏；missing 键 `missing_test_data:<key>` 警告并保留占位符提示人工填充重跑——Hercules 引擎侧没有机械消费者，这是 phase1 P0-2 定的编排决策 | §2 D28；§4 K3 |
-| 录制器对 UI 变异的自愈怎么保证？产物凭什么能被引擎执行？ | 定位 hint 直接写录制时的 name/label（与引擎感知属性"同源"的契约口径），`(occurrence n)` 消歧同名元素；不持久化任何 selector，每次执行引擎重新感知 DOM；"同源"的精度争议（引擎无 label 关联）如实承认，评测期用 name 命中率数据决定补哪边 | §2 D6；§4 K16 |
-| 为什么整机回放录制时动作间要停 450ms？ | 快照 300ms 延迟 + 归给最新事件 + 单事件 8 条 assert_texts 上限，三个参数合起来意味着机器连续动作会把多条 DOM 变化压进最后一个事件、挤掉前面的断言（实测 F3"下单成功"被挤掉）；真人手速天然满足，机器回放 `STEP_WAIT_MS=450` | §3.3 录制节奏 |
-| 测试怎么做到全离线又高覆盖？ | recorder：pytest+playwright 以 evaluate 注入同一份 JS 源（与生产同构），21 例全绿；distiller：FakePolisher 注入 + DefaultPolisher 仅离线双打（fake chat model）+ `ENABLE_TELEMETRY=0` 关 Sentry 外发，骨架三模块负向 grep 证明零模型依赖，68 例 2-3 秒跑完 | §3.1/§3.2；§4 K12 |
-| 测试数量怎么长起来的？ | recorder 20 条 spec 用例 + 1 条归因回归 = 21；distiller 35 条 spec 用例落地为 64（参数化），P0-1 修复 +3 = 67，P1-4 标题清洗 +1 = 68（+1 来自提交 7ce6c95 的 `test_title_sanitized_to_filename_safe`）；合并态 85 → P0-1 后 88 → 全局五模块 492 | §6 数字对照表 |
-| 哪些是你明确不做的？ | recorder：跨域 iframe、shadow DOM（含 open——open 的合成事件 target 被重定向语义失真）、canvas、多 tab、扩展形态、回放编辑 UI、性能优化、断言自动生成；distiller：多 Scenario、中文模板、复杂断言推理、数据抽取、引擎侧 test_data 自动注入、模型路由调优——边界全部写进两份 spec 的 Out of Scope | §2 D1/D12；recorder spec §9；distiller spec §8 |
+| 300ms | 每个事件入队后延迟抓快照的窗口，让 DOM 更新先落地 | 被问 assert_texts / 断言来源（qa-bank Q4） |
+| 450ms | 评测机器回放的动作间隔 = 300ms 快照窗口 + 落地余量 | 被问机器回放节奏（Q8 追问） |
+| ≤8 条 | 单事件 assert_texts 条数上限（超出会挤掉断言，F3 教训） | 被问断言数量与体积控制 |
+| ≤120 字符 | 断言文本单条上限；也是蒸馏标题截断（TITLE 上限）与润色事件摘要 value 截断 | 被问字段上限 |
+| ≤200 字符 | 元素 name 上限（首行/trim/压缩空白）；select 选中值同上限 | 被问字段上限 |
+| ≤500 字符 | 文本输入 value 上限（去首尾换行） | 被问字段上限 |
+| 5 类事件 | navigate/click/input/select/submit，枚举不新增 | 被问 Schema |
+| 8 + 7 + 2 | 事件 8 字段 / target 7 字段 / session 2 字段 | 被问 Schema v1 契约 |
+| 5 级优先 | name 取值链：aria-label→关联 label→placeholder→innerText→title | 被问元素定位（Q8） |
+| ordinal >1 | 同名集合大于 1 才记序号（1-based）；蒸馏时追加 (occurrence n) | 被问同名元素消歧 |
+| 10 个标签 | 快照可见文本的排除标签集（script/style/option/select 等） | 深挖快照采集 |
+| 500ms | 测试中等待快照落地的时长 = 300ms + 200ms 余量 | 被问测试写法 |
+| 20 → 21 | recorder 用例：spec 20 条 → 加快照归因回归 1 条 = 21 | 被问测试规模 |
+| 35 → 64 → 67 → 68 | distiller：spec 35 条（A17/B6/C7/D5）落地 64（22+25+11+6），P0-1 +3=67，P1-4 +1=68 | 被问测试规模与增长 |
+| 85 / 88 / 9÷9 | 合并态全量 85（21+64）→ P0-1 后 88（21+67）；集成冒烟 9/9 | 被问合并后质量 |
+| 492 / 89 | 全局基线 492 = 21+68+77(evaluation)+81(attributor)+54(cli)+191(benchmark)，2026-09-24 collect 实测；本模块当前 89 collected | 被问整体测试规模 |
+| 9.97 / 9.82 / 9.88s | recorder 20 例连续三次运行耗时（真浏览器、全离线） | 被问测试速度与真实性 |
+| 2-3 秒 | distiller 68 例全离线耗时 | 被问测试速度 |
+| 561→575 行 / 16458→18218 字符 | recorder.js 交付时点 → 快照归因修复后的体量（单文件、零依赖） | 被问"代码量/单文件多大" |
+| 32293→34117 字符 | bookmarklet.txt 体量（交付时点 → 修复后），无尾随换行 | 被问 bookmarklet 产物 |
+| >100KB | Chrome bookmarklet 长度上限（宽松，无需压缩） | 被问"为什么不做 minify" |
+| 11 字符 | `javascript:` 前缀实际长度（spec 曾误写 10） | 被问验收细节（故事 9） |
+| 47 行 | bookmarklet 打包脚本体量（纯标准库） | 被问"小而准" |
+| 0.0 / ≤2 / 60s | 润色温度 / 总尝试次数 / 单次超时（弱模型档 distiller_polish） | 被问润色层配置 |
+| 4 道闸 / 5 条失败路径 | 清洗非空→结构→事实回查→断言存活；polish_empty / syntax_invalid / fact_check_failed / assertion_dropped / polish_error | 被问润色安全 |
+| ≤5 个 | fallback_reason 里字面值列表的上限 | 深挖回退原因 |
+| 4 个豁免词 | element / field / dropdown / form（模板兜底常量） | 被问回查豁免（故事 4） |
+| 6 组事实集 | urls / values / hints / assertions / other / caller_values | 被问事实集构成 |
+| 7 个关键词 | 结构校验允许的行首词：Feature/Scenario/Given/When/Then/And/But | 被问结构校验 |
+| 8 个 warning | 4 核心（empty_events / unknown_event_type / missing_url / empty_value）+ 4 个 payload 宽松分支 | 被问容错行为 |
+| >20 条 | 单事件断言量的截断警戒线（当前只去重不去量；大于录制端 8 条上限） | 深挖断言体积 |
+| 2 遍蒸馏 | CLI generate 两遍蒸馏（先骨架提取键集，再终蒸馏） | 被问占位符填充（故事 3） |
+| 277/156/205/159/122 | distiller 五模块行数（events/templates/factcheck/polisher/api） | 被问代码结构 |
+| 4 + 1 份 | distiller 手写 fixtures 4 份 JSON + recorder 1 份 HTML（demo 表单页） | 被问测试数据 |
+| 200 / 12 | black 行宽 200；12 个文件 fmt 检查全部不变更 | 被问工程规范 |
 
-## 6. 数字与出处对照表
+## 6. 联动
 
-| 数字/事实 | 值 | 出处（文件:位置） |
-|---|---|---|
-| 快照延迟 | `SNAPSHOT_DELAY_MS = 300` | recorder spec §3；recorder.js:13 |
-| assert_texts 上限 | 最多 8 条、每条 ≤120 字符 | recorder spec §3；recorder.js:16-17（`ASSERT_TEXT_MAX_LENGTH=120` / `ASSERT_TEXT_MAX_COUNT=8`） |
-| name 上限 | ≤200 字符（首行/trim/压缩空白） | recorder spec §2.1.2；recorder.js:14 |
-| input value 上限 | ≤500 字符（去首尾换行） | recorder spec §2.2；recorder.js:15 |
-| select value 上限 | ≤200 字符（与 name 同一套清洗） | recorder spec §2.2；recorder.js:400-404 注释 |
-| 事件字段 | 8 事件键（seq/ts/type/url/page_title/target/value/dom_snapshot）+ 7 target 键 | recorder spec §2/§2.1；phase1 专项核查 1 |
-| 事件枚举 | navigate/click/input/select/submit 共 5 值，不新增 | PLAN §3.1；recorder spec §2；events.py:14 |
-| recorder spec 用例数 | 20 条（§7 清单），实际交付 20/20 通过 → 快照修复后 21 例（+1 回归） | recorder spec §7/§8；test-report §2/补记；test_snapshot.py:44 |
-| recorder 测试耗时 | 20 passed in 9.97s / 9.82s / 9.88s（连续 3 次） | recorder test-report §2 |
-| recorder.js 体量 | test-report 时点 561 行 / 16458 字符；现工作区（0ad2075 后）575 行 / 18218 字符 | recorder test-report §1；实测 `wc` |
-| bookmarklet.txt 体量 | test-report 时点 32293 字符；现 34117 字符；前缀 `javascript:` 实为 11 字符（spec 误写"首 10 字符"） | recorder test-report §1/§4.2；实测 `wc -c` |
-| 蒸馏三层 | 规则模板（零 LLM）→ 可选润色 → 事实回查 | distiller plan §2 |
-| distiller spec 用例数 | 35 条（§6：A 17 / B 6 / C 7 / D 5），落地 64 条（22+25+11+6） | distiller spec §6；test-report §2 |
-| distiller 用例增长 | 64 →（P0-1 +3，fe11083）67 →（P1-4 +1，7ce6c95 的 `test_title_sanitized_to_filename_safe`）68 | distiller test-report 补记；git show 7ce6c95；STATUS.md:20 |
-| 合并态全量 | 85 passed = recorder 21 + distiller 64（main 4f0df82）；P0-1 后 88 passed（21+67）；集成冒烟 9/9 | phase1-merge-analysis.md:4；distiller test-report 补记；recorder test-report 补记 |
-| 全局基线 | 492 passed = recorder 21 + distiller 68 + evaluation 77 + attributor 81 + cli 54 + benchmark 191（2026-09-24 --collect-only 逐模块实测） | STATUS.md:20 |
-| 当前收集数 | recorder 21 + distiller 68 = 89 collected（实测 `pytest --collect-only`） | 本档案核实（2026-10-10） |
-| 标题截断 | `TITLE_MAX_LENGTH = 120`；文件名安全正则 `[^\w\- ]+` → `_` 折叠 | distiller spec §2.1；templates.py:22/52 |
-| fallback_reason 字面值上限 | 最多列 5 个（`MAX_REPORTED_LITERALS = 5`） | distiller spec §5.3；factcheck.py:30 |
-| DefaultPolisher 参数 | role key `distiller_polish`；温度 0.0；总尝试 ≤2；单次超时 60s；digest value 截 120 | distiller spec §4.1；polisher.py:14-19 |
-| 占位符格式 | `{{TEST_DATA:password_{seq}}}`（`password_<seq>`；无 seq 用排序后数组序号） | distiller spec §2.3；templates.py:34 |
-| 字面值正则 | `"((?:[^"\\]|\\.)*)"`；占位符 `^\{\{TEST_DATA:[^{}]*\}\}$` | distiller spec §5.2；factcheck.py:21/24 |
-| 豁免常量 | `element` / `field` / `dropdown` / `form` 四词 | distiller spec §5.2；factcheck.py:27 |
-| CLI P0-2 | 两遍蒸馏；missing → `missing_test_data:<key>` 保留占位符；unused → `unused_test_data:<key>` | cli.py:303-404；STATUS.md:30 |
-| 录制节奏约束 | `STEP_WAIT_MS = 450`（evaluation record_flows.py:44；300ms 快照 + 归因 + 8 条上限的推论） | evaluation test-report:113 |
-| 关键提交 | 4283ebe（recorder 初版 20 例）→ 0ad2075（快照归因修复，2026-09-21 01:33）→ 9664cd3（distiller 初版 64 例）→ 4f0df82（main 合并，85 passed）→ fe11083（P0-1，2026-09-21 01:59，88 passed）→ 7ce6c95（P1-4，2026-09-21 03:05，distiller 68） | git log/show |
-| 日期矛盾注 | distiller test-report 补记标注 P0-1 为"2026-09-20 合并后修复"，git 提交 fe11083 实为 2026-09-21 01:59；且其"总数 85→88"要求 recorder 已是 21 例（快照修复在前），按 git 时间轴顺序为：快照修复 01:33 → P0-1 01:59 → P1-4 03:05。两说并注，以 git 为准 | distiller test-report 补记；git show |
-| Chrome bookmarklet 上限 | 宽松（>100KB），无需压缩 | recorder plan §2 |
-| 蒸馏器 assert 警戒线 | >20 条/事件的截断策略留评测数据决定（当前不去量只去重） | distiller spec §9；recorder review 交叉核对表（"蒸馏器 20 条警戒线 > 录制器 8 条上限"） |
-| 引擎锚点 | getAccessibleName get_detailed_accessibility_tree.py:1050-1087（行号核实无误）；getRole :1098-1148；gherkin_helper.py:102-134（serialize 压缩）；gherkin_generator.py:11-22（clean_gherkin_output）；gherkin_helper.py:70-71（文件名 replace） | recorder review 备注 a；distiller review 交叉核对表；phase1 P1-3/P1-4 |
-| fixtures | recorder 1 份（demo_form.html）；distiller 4 份（login_search/form_submit/sparse_fields/empty_session.json） | test-report §1（两份） |
-| Sentry 关断 | conftest `ENABLE_TELEMETRY=0`（setdefault）消除 `Sentry is attempting to send 2 pending events` | distiller test-report §2 |
-| black/isort | line-length 200；`12 files would be left unchanged`（distiller+tests） | distiller test-report §3 命令 C |
+- **Q1 整体架构分层** → §2 60 秒主线 + §3 卡 9（三层蒸馏架构）与卡 1（录制形态）。
+- **Q2 骨架层零 LLM** → §3 卡 9（架构与恒合法保证）+ 卡 12（四道闸整体回退）。
+- **Q3 事实回查怎么防幻觉** → §3 卡 11（精确匹配规则与豁免）+ §4 故事 8（严格子串的严宽取舍）。
+- **Q4 断言可靠性** → §3 卡 7（快照差集机制）+ §4 故事 1（快照归因缺陷——Q4 的预设追问就指向它）。
+- **Q8 用例凭什么能被执行** → §3 卡 6（name 五级优先与 ordinal）、卡 17（Schema 契约）+ §4 故事 1（集成冒烟与单测互补）。
+- **Q9 submit 双事件契约** → §3 卡 14（规则层去重）+ §4 故事 2（契约悬空全过程）。
